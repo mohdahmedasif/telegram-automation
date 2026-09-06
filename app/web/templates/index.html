@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Relay — Automations</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="atmosphere" aria-hidden="true"></div>
+
+  <header class="site-header">
+    <p class="brand">Relay</p>
+    <p class="tagline">Your automations, in one place. Start and stop them from here.</p>
+    <p class="stats">
+      <span data-running>{{ running_count }}</span> running
+      <span class="dot">·</span>
+      <span data-total>{{ total_count }}</span> total
+    </p>
+  </header>
+
+  <main class="catalog">
+    <h1 class="section-title">Automations</h1>
+
+    {% if not automations %}
+    <p class="empty">No automations registered yet. Add one under <code>automations/</code> and list it in <code>app/registry.py</code>.</p>
+    {% else %}
+    <ul class="automation-list" id="automation-list">
+      {% for item in automations %}
+      <li class="automation" data-id="{{ item.id }}" data-status="{{ item.status }}">
+        <div class="automation-copy">
+          <div class="automation-top">
+            <h2>{{ item.name }}</h2>
+            <span class="status-pill" data-status-label>{{ item.status }}</span>
+          </div>
+          <p class="description">{{ item.description }}</p>
+          {% if item.tags %}
+          <ul class="tags">
+            {% for tag in item.tags %}
+            <li>{{ tag }}</li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+          <p class="error-line {% if not item.error %}is-hidden{% endif %}" data-error>
+            {{ item.error or "" }}
+          </p>
+        </div>
+        <div class="automation-actions">
+          <button
+            type="button"
+            class="btn btn-start"
+            data-action="start"
+            {% if item.status in ['running', 'starting'] %}disabled{% endif %}
+          >Start</button>
+          <button
+            type="button"
+            class="btn btn-stop"
+            data-action="stop"
+            {% if item.status not in ['running', 'error'] %}disabled{% endif %}
+          >Stop</button>
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </main>
+
+  <footer class="site-footer">
+    <p>Register new automations in <code>app/registry.py</code>.</p>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
