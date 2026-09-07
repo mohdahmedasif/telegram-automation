@@ -1,0 +1,15 @@
+[Unit]
+Description=Relay Telegram automation hub
+After=network.target
+
+[Service]
+Type=simple
+User=REPLACE_USER
+WorkingDirectory=/REPLACE/PATH/telegram-automation
+EnvironmentFile=/REPLACE/PATH/telegram-automation/.env
+ExecStart=/REPLACE/PATH/telegram-automation/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

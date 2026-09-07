@@ -115,6 +115,47 @@ Row 1 = headers; data starts at row 2.
 
 It will appear automatically in the Relay UI.
 
+## Auto-deploy (GitHub Actions → VPS over SSH)
+
+On every push to `main`, [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) SSHs into your server, pulls, installs deps, and restarts Relay.
+
+### 1. One-time server setup
+
+```bash
+# On the VPS
+git clone https://github.com/mohdahmedasif/telegram-automation.git
+cd telegram-automation
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # fill secrets
+# put credentials.json here
+
+# systemd (recommended)
+sudo cp deploy/relay.service /etc/systemd/system/relay.service
+# edit User= and WorkingDirectory= / EnvironmentFile= / ExecStart=
+sudo systemctl daemon-reload
+sudo systemctl enable --now relay
+```
+
+Generate a **deploy key pair** on your laptop (or the VPS), put the **public** key in the server `~/.ssh/authorized_keys`, and keep the **private** key for GitHub Secrets (do not use your personal GitHub account SSH key for Actions).
+
+### 2. GitHub repo secrets
+
+Settings → Secrets and variables → Actions:
+
+| Secret | Example |
+|--------|---------|
+| `DEPLOY_HOST` | `203.0.113.10` or `vps.example.com` |
+| `DEPLOY_USER` | `ubuntu` |
+| `DEPLOY_SSH_KEY` | full private key (`-----BEGIN … KEY-----`) |
+| `DEPLOY_PATH` | `/home/ubuntu/telegram-automation` |
+| `DEPLOY_PORT` | `22` (optional) |
+
+### 3. Deploy
+
+Push to `main`, or run **Actions → Deploy → Run workflow**.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
