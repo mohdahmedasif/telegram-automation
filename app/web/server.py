@@ -52,9 +52,9 @@ def create_app() -> FastAPI:
             1 for a in automations if a["status"] == AutomationStatus.RUNNING.value
         )
         return TEMPLATES.TemplateResponse(
+            request,
             "index.html",
             {
-                "request": request,
                 "automations": automations,
                 "running_count": running,
                 "total_count": len(automations),
