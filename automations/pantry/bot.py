@@ -29,7 +29,7 @@ from telegram.ext import (
 
 logger = logging.getLogger("automations.pantry")
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 
 COL_COUNT = 4
 
