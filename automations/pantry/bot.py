@@ -1000,7 +1000,7 @@ class PantryBotRuntime:
                     pool_timeout=30.0,
                 )
             )
-            .concurrent_updates(True)
+            .concurrent_updates(False)
             .build()
         )
 
@@ -1114,6 +1114,37 @@ class PantryBotRuntime:
             "awaiting": awaiting,
         }
 
+    async def _send_prompt(
+        self,
+        message,
+        text: str,
+        *,
+        edit: bool,
+        reply_markup: InlineKeyboardMarkup | None,
+    ) -> None:
+        """Send/edit a prompt; fall back to plain text if Markdown fails."""
+        kwargs: dict[str, Any] = {"reply_markup": reply_markup}
+        try:
+            if edit:
+                await message.edit_text(
+                    text, parse_mode=ParseMode.MARKDOWN, **kwargs
+                )
+            else:
+                await message.reply_text(
+                    text, parse_mode=ParseMode.MARKDOWN, **kwargs
+                )
+        except Exception:
+            logger.warning("Markdown prompt failed; retrying as plain text", exc_info=True)
+            plain = (
+                text.replace("*", "")
+                .replace("`", "")
+                .replace("_", "")
+            )
+            if edit:
+                await message.edit_text(plain, **kwargs)
+            else:
+                await message.reply_text(plain, **kwargs)
+
     def _clarify_keyboard(
         self, field: str, item: dict[str, Any]
     ) -> InlineKeyboardMarkup | None:
@@ -1223,14 +1254,7 @@ class PantryBotRuntime:
                 + "\n\nSave it to the pantry?"
             )
             markup = self._confirm_keyboard()
-            if edit:
-                await message.edit_text(
-                    text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
-                )
-            else:
-                await message.reply_text(
-                    text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
-                )
+            await self._send_prompt(message, text, edit=edit, reply_markup=markup)
             return
 
         field = missing[0]
@@ -1244,14 +1268,7 @@ class PantryBotRuntime:
             f"_Draft so far:_\n{self.format_item_markdown(item)}"
         )
         markup = self._clarify_keyboard(field, item)
-        if edit:
-            await message.edit_text(
-                prompt, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
-            )
-        else:
-            await message.reply_text(
-                prompt, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
-            )
+        await self._send_prompt(message, prompt, edit=edit, reply_markup=markup)
 
     async def _begin_add_flow(
         self,
@@ -1271,20 +1288,30 @@ class PantryBotRuntime:
             self._set_pending(
                 context, item=item, provided=provided, awaiting="confirm"
             )
-            await status_message.edit_text(
+            await self._send_prompt(
+                status_message,
                 "Please confirm this item:\n\n"
                 + self.format_item_markdown(item)
                 + "\n\nSave it to the pantry?",
-                parse_mode=ParseMode.MARKDOWN,
+                edit=True,
                 reply_markup=self._confirm_keyboard(),
             )
             return
 
-        await status_message.edit_text(
-            f"Got *{_escape_md(item.get('Item Name'))}*. "
-            f"I need {len(missing)} more detail(s) before saving.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        # Clear any old inline buttons on the status message.
+        try:
+            await status_message.edit_text(
+                f"Got *{_escape_md(item.get('Item Name'))}*. "
+                f"I need {len(missing)} more detail(s) before saving.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=None,
+            )
+        except Exception:
+            await status_message.edit_text(
+                f"Got {item.get('Item Name')}. "
+                f"I need {len(missing)} more detail(s) before saving.",
+                reply_markup=None,
+            )
         await self._prompt_next_clarification(
             update.effective_message, context, edit=False
         )
@@ -1419,6 +1446,7 @@ class PantryBotRuntime:
             "🔍 Analyzing photo with Gemini…"
         )
         caption = update.message.caption or ""
+        self._clear_pending(context)
 
         try:
             image_bytes = await self._download_best_photo(update, context)
@@ -1686,6 +1714,17 @@ class PantryBotRuntime:
                     )
                     return
 
+                if not self._get_pending(context):
+                    await query.answer(
+                        "Add session expired — send a photo or /add again.",
+                        show_alert=True,
+                    )
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                    return
+
                 if data == "cf:save":
                     item = await self._save_pending_item(context)
                     await query.edit_message_text(
@@ -1701,7 +1740,7 @@ class PantryBotRuntime:
                         context, "Unit Size", value
                     )
                     if error:
-                        await query.edit_message_text(error)
+                        await query.answer(error, show_alert=True)
                         return
                     await self._prompt_next_clarification(
                         query.message, context, edit=True
@@ -1718,7 +1757,7 @@ class PantryBotRuntime:
                         context, "Expiration Date", value
                     )
                     if error:
-                        await query.edit_message_text(error)
+                        await query.answer(error, show_alert=True)
                         return
                     await self._prompt_next_clarification(
                         query.message, context, edit=True
@@ -1730,25 +1769,25 @@ class PantryBotRuntime:
                     key, idx_s = match.groups()
                     field = CALLBACK_KEY_TO_FIELD.get(key)
                     if not field:
-                        await query.edit_message_text("❌ Unknown field.")
+                        await query.answer("Unknown field.", show_alert=True)
                         return
                     choices = FIELD_CHOICES.get(field) or []
                     idx = int(idx_s)
                     if idx < 0 or idx >= len(choices):
-                        await query.edit_message_text("❌ Invalid choice.")
+                        await query.answer("Invalid choice.", show_alert=True)
                         return
                     error = await self._apply_field_answer(
                         context, field, choices[idx]
                     )
                     if error:
-                        await query.edit_message_text(error)
+                        await query.answer(error, show_alert=True)
                         return
                     await self._prompt_next_clarification(
                         query.message, context, edit=True
                     )
                     return
 
-                await query.edit_message_text("❌ Unknown action.")
+                await query.answer("Unknown action.", show_alert=True)
             except Exception:
                 logger.exception("Clarify callback failed: %s", data)
                 self._clear_pending(context)
