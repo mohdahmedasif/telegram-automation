@@ -117,7 +117,7 @@ It will appear automatically in the Relay UI.
 
 ## Auto-deploy (GitHub Actions → VPS over SSH)
 
-On every push to `main`, [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) SSHs into your server, pulls, installs deps, and restarts Relay.
+On every push to `main`, [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) SSHs into your server and runs [`scripts/update.sh`](scripts/update.sh) (git pull → pip install → restart).
 
 ### 1. One-time server setup
 

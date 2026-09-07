@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Pull latest main, install deps, restart Relay.
+# Used by GitHub Actions deploy and safe to run manually on the VPS:
+#   bash scripts/update.sh
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+BRANCH="${RELAY_DEPLOY_BRANCH:-main}"
+
+echo "==> Updating Relay in $ROOT (branch: $BRANCH)"
+
+if [ ! -d .git ]; then
+  echo "ERROR: $ROOT is not a git repository."
+  exit 1
+fi
+
+echo "==> git fetch / pull"
+git fetch origin "$BRANCH"
+git checkout "$BRANCH"
+git pull --ff-only origin "$BRANCH"
+
+echo "==> Python dependencies"
+if [ -d .venv ]; then
+  # shellcheck disable=SC1091
+  . .venv/bin/activate
+elif [ -f venv/bin/activate ]; then
+  # shellcheck disable=SC1091
+  . venv/bin/activate
+else
+  echo "WARN: no .venv found — using system Python"
+fi
+
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+echo "==> Restart"
+bash "$ROOT/scripts/restart.sh"
+
+echo "==> Update complete ($(git rev-parse --short HEAD))"

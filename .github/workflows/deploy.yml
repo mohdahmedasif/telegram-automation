@@ -11,9 +11,10 @@ concurrency:
 
 jobs:
   deploy:
+    name: Pull and update on VPS
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy over SSH
+      - name: SSH — git pull + install + restart
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.DEPLOY_HOST }}
@@ -23,36 +24,5 @@ jobs:
           script_stop: true
           script: |
             set -euo pipefail
-            APP_DIR="${{ secrets.DEPLOY_PATH }}"
-            cd "$APP_DIR"
-
-            echo "==> Fetching latest main"
-            git fetch origin main
-            git checkout main
-            git pull --ff-only origin main
-
-            if [ -d .venv ]; then
-              # shellcheck disable=SC1091
-              . .venv/bin/activate
-            elif [ -f venv/bin/activate ]; then
-              # shellcheck disable=SC1091
-              . venv/bin/activate
-            fi
-
-            echo "==> Installing dependencies"
-            pip install -r requirements.txt
-
-            echo "==> Restarting service"
-            if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q '^relay.service'; then
-              sudo systemctl restart relay
-              sudo systemctl --no-pager --full status relay || true
-            elif [ -f scripts/restart.sh ]; then
-              bash scripts/restart.sh
-            else
-              echo "No relay.service or scripts/restart.sh found."
-              echo "Pulled code successfully; restart the app manually this once,"
-              echo "or install deploy/relay.service (see README)."
-              exit 1
-            fi
-
-            echo "==> Deploy complete"
+            cd "${{ secrets.DEPLOY_PATH }}"
+            bash scripts/update.sh
