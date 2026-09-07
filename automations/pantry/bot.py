@@ -742,16 +742,7 @@ class PantryBotRuntime:
         if not update.message:
             return
         await update.message.reply_text(
-            (
-                "*Pantry Inventory Bot*\n\n"
-                "Add items with `/add pasta`, a photo, or plain text.\n\n"
-                "Commands:\n"
-                "• `/add <item>` – add an item (e.g. `/add pasta 2`)\n"
-                "• `/search <query>` – find items\n"
-                "• `/edit <query>` – change count or delete\n"
-                "• `/list` – show recent items\n"
-                "• `/help` – show this help\n"
-            ),
+            self._options_message(greeting=False),
             parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -759,6 +750,24 @@ class PantryBotRuntime:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         await self.start_command(update, context)
+
+    @staticmethod
+    def _options_message(*, greeting: bool) -> str:
+        header = (
+            "👋 Hey! I'm your pantry bot.\n\n"
+            if greeting
+            else "*Pantry Inventory Bot*\n\n"
+        )
+        return (
+            f"{header}"
+            "Here's what I can do — pick one:\n\n"
+            "• `/add <item>` — add something (e.g. `/add pasta 2`)\n"
+            "• `/search <query>` — find items\n"
+            "• `/edit <query>` — change count or delete\n"
+            "• `/list` — show recent items\n"
+            "• send a *photo* of a product to add it\n\n"
+            "_Tip: plain chat won't add items — use `/add`._"
+        )
 
     async def _save_text_item(
         self, update: Update, text: str, *, status_prefix: str
@@ -856,26 +865,22 @@ class PantryBotRuntime:
     async def handle_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        """Free text is conversation only — never auto-adds to the sheet."""
         if not update.message or not update.message.text:
             return
 
         text = update.message.text.strip()
-        if is_non_item_message(text):
-            await update.message.reply_text(
-                "👋 Hi! I only add pantry items.\n\n"
-                "Try:\n"
-                "• `/add pasta`\n"
-                "• `/search honey`\n"
-                "• `/edit rice`\n"
-                "• or send a product photo",
-                parse_mode=ParseMode.MARKDOWN,
+        greeting = is_non_item_message(text) or bool(
+            re.match(
+                r"^(hi+|hello|hey|howdy|what'?s up|what u do|what do you do|"
+                r"who are you|help me)\b",
+                text,
+                flags=re.IGNORECASE,
             )
-            return
-
-        await self._save_text_item(
-            update,
-            text,
-            status_prefix="➕ Adding item…",
+        )
+        await update.message.reply_text(
+            self._options_message(greeting=greeting),
+            parse_mode=ParseMode.MARKDOWN,
         )
 
     async def _reply_search_results(
