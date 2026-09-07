@@ -14,12 +14,39 @@ jobs:
     name: Pull and update on VPS
     runs-on: ubuntu-latest
     steps:
+      - name: Prepare SSH private key
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          RAW='${{ secrets.DEPLOY_SSH_KEY }}'
+          if [ -z "$RAW" ]; then
+            echo "DEPLOY_SSH_KEY secret is empty."
+            exit 1
+          fi
+
+          # Prefer base64 (recommended). Fall back to raw PEM if pasted with BEGIN.
+          if printf '%s' "$RAW" | grep -q 'BEGIN.*PRIVATE KEY'; then
+            printf '%s\n' "$RAW" | tr -d '\r' > ~/.ssh/deploy_key
+          else
+            printf '%s' "$RAW" | tr -d '\r\n ' | base64 -d > ~/.ssh/deploy_key
+          fi
+
+          chmod 600 ~/.ssh/deploy_key
+
+          if ! ssh-keygen -y -f ~/.ssh/deploy_key >/dev/null 2>&1; then
+            echo "DEPLOY_SSH_KEY could not be parsed."
+            echo "Store it as base64 of the private key file (see README)."
+            exit 1
+          fi
+
       - name: SSH — git pull + install + restart
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          key_path: /home/runner/.ssh/deploy_key
           port: ${{ secrets.DEPLOY_PORT }}
           script_stop: true
           script: |
