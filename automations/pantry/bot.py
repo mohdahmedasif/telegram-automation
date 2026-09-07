@@ -29,9 +29,14 @@ from telegram.ext import (
     filters,
 )
 
+from automations.gemini_util import (
+    generate_content_with_fallback,
+    resolve_gemini_model,
+)
+
 logger = logging.getLogger("automations.pantry")
 
-GEMINI_MODEL = "gemini-3.6-flash"
+GEMINI_MODEL = resolve_gemini_model()
 
 COL_COUNT = 4
 
@@ -853,8 +858,8 @@ class PantryBotRuntime:
 
         parts.append("\n".join(prompt_bits))
 
-        response = await self.genai_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
+        response = await generate_content_with_fallback(
+            self.genai_client,
             contents=parts,
             config=types.GenerateContentConfig(
                 system_instruction=EXTRACTION_SYSTEM_INSTRUCTION,
@@ -865,6 +870,7 @@ class PantryBotRuntime:
                     disable=True
                 ),
             ),
+            primary_model=GEMINI_MODEL,
         )
 
         raw_text = (response.text or "").strip()

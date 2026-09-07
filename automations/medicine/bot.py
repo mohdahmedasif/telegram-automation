@@ -30,9 +30,14 @@ from telegram.ext import (
     filters,
 )
 
+from automations.gemini_util import (
+    generate_content_with_fallback,
+    resolve_gemini_model,
+)
+
 logger = logging.getLogger("automations.medicine")
 
-GEMINI_MODEL = "gemini-3.6-flash"
+GEMINI_MODEL = resolve_gemini_model()
 
 # A=1 Item Name … E=5 Count
 COL_COUNT = 5
@@ -729,15 +734,19 @@ class MedicineBotRuntime:
 
         parts.append("\n".join(prompt_bits))
 
-        response = await self.genai_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
+        response = await generate_content_with_fallback(
+            self.genai_client,
             contents=parts,
             config=types.GenerateContentConfig(
                 system_instruction=EXTRACTION_SYSTEM_INSTRUCTION,
                 response_mime_type="application/json",
                 response_json_schema=ITEM_RESPONSE_SCHEMA,
                 temperature=0.2,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
+                ),
             ),
+            primary_model=GEMINI_MODEL,
         )
 
         raw_text = (response.text or "").strip()
@@ -822,14 +831,18 @@ class MedicineBotRuntime:
             f"Inventory JSON:\n{json.dumps(compact, ensure_ascii=False)}"
         )
 
-        response = await self.genai_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
+        response = await generate_content_with_fallback(
+            self.genai_client,
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=SEARCH_SYSTEM_INSTRUCTION,
                 response_mime_type="application/json",
                 temperature=0.1,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
+                ),
             ),
+            primary_model=GEMINI_MODEL,
         )
 
         raw_text = (response.text or "").strip()
