@@ -12,50 +12,22 @@ concurrency:
 jobs:
   deploy:
     name: Pull and update on VPS
-    runs-on: ubuntu-latest
+    # Runs on your VPS runner (label: self-hosted). No SSH key required.
+    runs-on: self-hosted
     steps:
-      - name: Prepare SSH private key
-        env:
-          # Passed via env so multiline PEM keeps real newlines
-          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      - name: Deploy (git pull + install + restart)
         run: |
           set -euo pipefail
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-
-          if [ -z "${SSH_KEY:-}" ]; then
-            echo "DEPLOY_SSH_KEY secret is empty."
+          APP_DIR="${{ secrets.DEPLOY_PATH }}"
+          if [ -z "$APP_DIR" ]; then
+            APP_DIR="$GITHUB_WORKSPACE"
+          fi
+          if [ -d "$APP_DIR/.git" ]; then
+            cd "$APP_DIR"
+          elif [ -d "$HOME/telegram-automation/.git" ]; then
+            cd "$HOME/telegram-automation"
+          else
+            echo "Set DEPLOY_PATH secret to your repo folder on the VPS."
             exit 1
           fi
-
-          # Strip Windows CR; write exact secret bytes
-          printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key
-
-          # If the secret is base64 (no PEM header), decode it
-          if ! grep -q 'BEGIN.*PRIVATE KEY' ~/.ssh/deploy_key; then
-            tr -d '\n\r ' < ~/.ssh/deploy_key | base64 -d > ~/.ssh/deploy_key.bin
-            mv ~/.ssh/deploy_key.bin ~/.ssh/deploy_key
-          fi
-
-          chmod 600 ~/.ssh/deploy_key
-
-          if ! ssh-keygen -y -f ~/.ssh/deploy_key >/dev/null 2>&1; then
-            echo "DEPLOY_SSH_KEY could not be parsed as a private key."
-            echo "Paste the full private key (BEGIN…END), or a base64 of that file."
-            exit 1
-          fi
-
-          echo "SSH private key OK"
-
-      - name: SSH — git pull + install + restart
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key_path: /home/runner/.ssh/deploy_key
-          port: ${{ secrets.DEPLOY_PORT }}
-          script_stop: true
-          script: |
-            set -euo pipefail
-            cd "${{ secrets.DEPLOY_PATH }}"
-            bash scripts/deploy.sh
+          bash scripts/deploy.sh

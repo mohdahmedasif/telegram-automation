@@ -115,56 +115,46 @@ Row 1 = headers; data starts at row 2.
 
 It will appear automatically in the Relay UI.
 
-## Auto-deploy (GitHub Actions → VPS over SSH)
+## Auto-deploy (GitHub Actions on your VPS)
 
-On every push to `main`, [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) SSHs into your server and runs [`scripts/deploy.sh`](scripts/deploy.sh) (git pull → pip install → restart).
+On every push to `main`, GitHub runs [`scripts/deploy.sh`](scripts/deploy.sh) **on your VPS** via a self-hosted runner (git pull → pip install → restart).
 
-### 1. One-time server setup
+No SSH deploy key is required — the job already runs on the server.
+
+### 1. One-time: install the app on the VPS
 
 ```bash
-# On the VPS
 git clone https://github.com/mohdahmedasif/telegram-automation.git
 cd telegram-automation
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # fill secrets
-# put credentials.json here
+cp .env.example .env   # fill secrets + credentials.json
 
-# systemd (recommended)
 sudo cp deploy/relay.service /etc/systemd/system/relay.service
-# edit User= and WorkingDirectory= / EnvironmentFile= / ExecStart=
+# edit User= / paths in that file
 sudo systemctl daemon-reload
 sudo systemctl enable --now relay
 ```
 
-Generate a **deploy key pair** on your laptop (or the VPS), put the **public** key in the server `~/.ssh/authorized_keys`, and keep the **private** key for GitHub Secrets (do not use your personal GitHub account SSH key for Actions).
+### 2. One-time: add a self-hosted runner (on the VPS)
 
-### 2. GitHub repo secrets
+In GitHub: **Settings → Actions → Runners → New self-hosted runner**  
+Pick **Linux**, then run the commands GitHub shows on the VPS (download, `./config.sh`, `./run.sh`).
 
-Settings → Secrets and variables → Actions:
+For a background service after config:
 
-| Secret | Example |
-|--------|---------|
-| `DEPLOY_HOST` | `203.0.113.10` or `vps.example.com` |
-| `DEPLOY_USER` | `ubuntu` |
-| `DEPLOY_SSH_KEY` | full private key (`-----BEGIN … KEY-----`) |
-| `DEPLOY_PATH` | `/home/ubuntu/telegram-automation` |
-| `DEPLOY_PORT` | `22` (optional) |
-
-Paste is unreliable. Prefer setting the secret **from the key file**:
-
-```powershell
-# Windows — creates secret without copy/paste mangling
-Get-Content -Raw $env:USERPROFILE\.ssh\github-actions-relay | gh secret set DEPLOY_SSH_KEY --repo mohdahmedasif/telegram-automation
+```bash
+sudo ./svc.sh install
+sudo ./svc.sh start
 ```
 
-Or paste the **entire private key** into `DEPLOY_SSH_KEY` (BEGIN through END, no leading spaces).  
-Put the matching `.pub` in the VPS `~/.ssh/authorized_keys`.
+Optional secret: `DEPLOY_PATH` = full path to the repo on the VPS  
+(e.g. `/home/ubuntu/telegram-automation`). If unset, the runner looks in `$HOME/telegram-automation`.
 
 ### 3. Deploy
 
-Push to `main`, or run **Actions → Deploy → Run workflow**.
+Push to `main`, or **Actions → Deploy → Run workflow**.
 
 ## License
 
