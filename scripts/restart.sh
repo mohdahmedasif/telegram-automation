@@ -1,12 +1,27 @@
 #!/usr/bin/env bash
-# Fallback restart when systemd unit is not installed.
+# Restart Relay via systemd when available; otherwise fall back to a pid file.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q '^relay.service'; then
-  sudo systemctl restart relay
+restart_unit() {
+  local unit="$1"
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files --no-legend --type=service 2>/dev/null | grep -q "^${unit}"; then
+    if [ "$(id -u)" -eq 0 ]; then
+      systemctl restart "$unit"
+      systemctl --no-pager --full status "$unit" || true
+    else
+      sudo systemctl restart "$unit"
+      sudo systemctl --no-pager --full status "$unit" || true
+    fi
+    echo "Restarted ${unit}"
+    return 0
+  fi
+  return 1
+}
+
+if restart_unit telegram-relay.service || restart_unit relay.service; then
   exit 0
 fi
 
