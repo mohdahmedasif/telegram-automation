@@ -161,6 +161,7 @@ CLARIFY_FIELDS = [
     "Storage Location",
     "Container Type",
     "Unit Size",
+    "Expiration Date",
 ]
 
 FIELD_CHOICES: dict[str, list[str]] = {
@@ -176,6 +177,10 @@ FIELD_PROMPTS = {
     "Storage Location": "Where is it stored?",
     "Container Type": "What container type?",
     "Unit Size": "What unit size? (e.g. `500g`, `1L`, or `N/A`)",
+    "Expiration Date": (
+        "What is the expiration date?\n"
+        "Send `YYYY-MM-DD` (e.g. `2028-07-07`), `July 2028`, or tap Skip."
+    ),
 }
 
 FIELD_CALLBACK_KEYS = {
@@ -239,6 +244,147 @@ def _coerce_choice(value: Any, allowed: list[str], default: str) -> str:
         if opt.casefold() in text.casefold() or text.casefold() in opt.casefold():
             return opt
     return default
+
+
+_MONTH_NAMES = {
+    "january": 1,
+    "jan": 1,
+    "february": 2,
+    "feb": 2,
+    "march": 3,
+    "mar": 3,
+    "april": 4,
+    "apr": 4,
+    "may": 5,
+    "june": 6,
+    "jun": 6,
+    "july": 7,
+    "jul": 7,
+    "august": 8,
+    "aug": 8,
+    "september": 9,
+    "sep": 9,
+    "sept": 9,
+    "october": 10,
+    "oct": 10,
+    "november": 11,
+    "nov": 11,
+    "december": 12,
+    "dec": 12,
+}
+
+
+def normalize_expiration(value: Any) -> str | None:
+    """
+    Normalize an expiration value to YYYY-MM-DD or N/A.
+
+    Returns None when the input cannot be parsed (caller should re-prompt).
+    """
+    from datetime import date, datetime
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.casefold() in {
+        "n/a",
+        "na",
+        "none",
+        "null",
+        "unknown",
+        "skip",
+        "-",
+        "no",
+        "n.a.",
+    }:
+        return "N/A"
+
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[./]", "-", text)
+
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%d-%m-%Y", "%m-%d-%Y", "%d-%m-%y", "%m-%y"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+            if fmt in {"%Y-%m", "%m-%y"}:
+                # Month-only → last day of month is unknown; use day 01.
+                return parsed.strftime("%Y-%m-01")
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    # "July 7, 2028" / "7 July 2028" / "July 2028"
+    month_day_year = re.fullmatch(
+        r"([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if month_day_year:
+        month = _MONTH_NAMES.get(month_day_year.group(1).casefold())
+        if month:
+            day = int(month_day_year.group(2))
+            year = int(month_day_year.group(3))
+            try:
+                return date(year, month, day).isoformat()
+            except ValueError:
+                return None
+
+    day_month_year = re.fullmatch(
+        r"(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+),?\s+(\d{4})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if day_month_year:
+        month = _MONTH_NAMES.get(day_month_year.group(2).casefold())
+        if month:
+            day = int(day_month_year.group(1))
+            year = int(day_month_year.group(3))
+            try:
+                return date(year, month, day).isoformat()
+            except ValueError:
+                return None
+
+    month_year = re.fullmatch(
+        r"([A-Za-z]+)\s+(\d{4})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if month_year:
+        month = _MONTH_NAMES.get(month_year.group(1).casefold())
+        if month:
+            year = int(month_year.group(2))
+            try:
+                return date(year, month, 1).isoformat()
+            except ValueError:
+                return None
+
+    return None
+
+
+def extract_expiration_from_text(text: str) -> str | None:
+    """Pull a plausible expiration from free text, if present."""
+    raw = text or ""
+    patterns = [
+        r"\bexp(?:iry|ires|iration)?\.?\s*[:=]?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+        r"\bexp(?:iry|ires|iration)?\.?\s*[:=]?\s*(\d{4}-\d{2}-\d{2})",
+        r"\bexp(?:iry|ires|iration)?\.?\s*[:=]?\s*([A-Za-z]+\s+\d{4})",
+        r"\b(\d{4}-\d{2}-\d{2})\b",
+        r"\b([A-Za-z]+\s+\d{1,2},?\s+\d{4})\b",
+        r"\b([A-Za-z]+\s+\d{4})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if not match:
+            continue
+        normalized = normalize_expiration(match.group(1))
+        if normalized and normalized != "N/A":
+            return normalized
+    return None
+
+
+def is_real_expiration(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text or text.upper() in {"N/A", "NA", "NONE", "NULL", "UNKNOWN", ""}:
+        return False
+    return normalize_expiration(text) not in (None, "N/A")
 
 
 def _is_bad_name(value: Any) -> bool:
@@ -353,6 +499,10 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
         working = working[: unit_match.start()] + " " + working[unit_match.end() :]
         provided.add("Unit Size")
 
+    expiration = extract_expiration_from_text(raw)
+    if expiration:
+        provided.add("Expiration Date")
+
     working = re.sub(r"\s+", " ", working).strip(" -,:;")
     count = 1
     name = working
@@ -389,6 +539,8 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
         item["Container Type"] = container
     if unit_size:
         item["Unit Size"] = unit_size
+    if expiration:
+        item["Expiration Date"] = expiration
 
     lowered = raw.casefold()
     for category, words in [
@@ -611,9 +763,10 @@ class PantryBotRuntime:
         )
 
         expiration = str(item["Expiration Date"]).strip()
-        if expiration.upper() in {"", "NONE", "NULL", "UNKNOWN"}:
-            expiration = "N/A"
-        item["Expiration Date"] = expiration
+        normalized_exp = normalize_expiration(expiration)
+        item["Expiration Date"] = (
+            normalized_exp if normalized_exp is not None else DEFAULTS["Expiration Date"]
+        )
 
         if not str(item["Reorder Status"]).strip():
             item["Reorder Status"] = DEFAULTS["Reorder Status"]
@@ -970,9 +1123,34 @@ class PantryBotRuntime:
                 ]
             )
 
+        if field == "Expiration Date":
+            rows: list[list[InlineKeyboardButton]] = []
+            suggested = str(item.get("Expiration Date", "")).strip()
+            if is_real_expiration(suggested):
+                normalized = normalize_expiration(suggested) or suggested
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            f"✅ Keep suggested: {normalized}",
+                            callback_data="cf:exp:keep",
+                        )
+                    ]
+                )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "Skip (N/A)", callback_data="cf:exp:na"
+                    )
+                ]
+            )
+            rows.append(
+                [InlineKeyboardButton("Cancel", callback_data="cf:cancel")]
+            )
+            return InlineKeyboardMarkup(rows)
+
         choices = FIELD_CHOICES.get(field) or []
         key = FIELD_CALLBACK_KEYS[field]
-        rows: list[list[InlineKeyboardButton]] = []
+        rows = []
         row: list[InlineKeyboardButton] = []
         for idx, choice in enumerate(choices):
             row.append(
@@ -1143,6 +1321,17 @@ class PantryBotRuntime:
             )
         elif field == "Unit Size":
             item["Unit Size"] = value
+        elif field == "Expiration Date":
+            if value.casefold() in {"keep", "suggested"}:
+                normalized = normalize_expiration(item.get("Expiration Date"))
+            else:
+                normalized = normalize_expiration(value)
+            if normalized is None:
+                return (
+                    "Could not read that date. Try `2028-07-07`, `July 2028`, "
+                    "or `N/A`."
+                )
+            item["Expiration Date"] = normalized
         else:
             return f"Unexpected field: {field}"
 
@@ -1243,6 +1432,12 @@ class PantryBotRuntime:
                 unit = str(item.get("Unit Size") or "").strip()
                 if unit and unit.upper() not in {"N/A", "NA", "UNKNOWN", ""}:
                     provided.add("Unit Size")
+                if is_real_expiration(item.get("Expiration Date")):
+                    item["Expiration Date"] = (
+                        normalize_expiration(item["Expiration Date"])
+                        or item["Expiration Date"]
+                    )
+                    provided.add("Expiration Date")
                 if item.get("Category") in CATEGORIES:
                     provided.add("Category")
                 if item.get("Storage Location") in STORAGE_LOCATIONS and (
@@ -1498,6 +1693,23 @@ class PantryBotRuntime:
                     value = data[5:] or "N/A"
                     error = await self._apply_field_answer(
                         context, "Unit Size", value
+                    )
+                    if error:
+                        await query.edit_message_text(error)
+                        return
+                    await self._prompt_next_clarification(
+                        query.message, context, edit=True
+                    )
+                    return
+
+                if data.startswith("cf:exp:"):
+                    action = data.split(":", 2)[-1]
+                    if action == "keep":
+                        value = "keep"
+                    else:
+                        value = "N/A"
+                    error = await self._apply_field_answer(
+                        context, "Expiration Date", value
                     )
                     if error:
                         await query.edit_message_text(error)

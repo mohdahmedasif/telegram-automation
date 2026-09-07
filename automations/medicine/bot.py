@@ -144,6 +144,7 @@ CLARIFY_FIELDS = [
     "Container Type",
     "Unit Size",
     "Formula",
+    "Expiration Date",
 ]
 
 FIELD_CHOICES: dict[str, list[str]] = {
@@ -160,6 +161,10 @@ FIELD_PROMPTS = {
     "Container Type": "What container type?",
     "Unit Size": "What strength / unit size? (e.g. `20mg`, `500mg`, or `N/A`)",
     "Formula": "What is the active formula/ingredient? (or `N/A`)",
+    "Expiration Date": (
+        "What is the expiration date?\n"
+        "Send `YYYY-MM-DD` (e.g. `2027-07-23`), `July 2027`, or tap Skip."
+    ),
 }
 
 FIELD_CALLBACK_KEYS = {
@@ -237,6 +242,139 @@ def _coerce_choice(value: Any, allowed: list[str], default: str) -> str:
     return default
 
 
+_MONTH_NAMES = {
+    "january": 1,
+    "jan": 1,
+    "february": 2,
+    "feb": 2,
+    "march": 3,
+    "mar": 3,
+    "april": 4,
+    "apr": 4,
+    "may": 5,
+    "june": 6,
+    "jun": 6,
+    "july": 7,
+    "jul": 7,
+    "august": 8,
+    "aug": 8,
+    "september": 9,
+    "sep": 9,
+    "sept": 9,
+    "october": 10,
+    "oct": 10,
+    "november": 11,
+    "nov": 11,
+    "december": 12,
+    "dec": 12,
+}
+
+
+def normalize_expiration(value: Any) -> str | None:
+    from datetime import date, datetime
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.casefold() in {
+        "n/a",
+        "na",
+        "none",
+        "null",
+        "unknown",
+        "skip",
+        "-",
+        "no",
+        "n.a.",
+    }:
+        return "N/A"
+
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[./]", "-", text)
+
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%d-%m-%Y", "%m-%d-%Y", "%d-%m-%y", "%m-%y"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+            if fmt in {"%Y-%m", "%m-%y"}:
+                return parsed.strftime("%Y-%m-01")
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    month_day_year = re.fullmatch(
+        r"([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if month_day_year:
+        month = _MONTH_NAMES.get(month_day_year.group(1).casefold())
+        if month:
+            day = int(month_day_year.group(2))
+            year = int(month_day_year.group(3))
+            try:
+                return date(year, month, day).isoformat()
+            except ValueError:
+                return None
+
+    day_month_year = re.fullmatch(
+        r"(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+),?\s+(\d{4})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if day_month_year:
+        month = _MONTH_NAMES.get(day_month_year.group(2).casefold())
+        if month:
+            day = int(day_month_year.group(1))
+            year = int(day_month_year.group(3))
+            try:
+                return date(year, month, day).isoformat()
+            except ValueError:
+                return None
+
+    month_year = re.fullmatch(
+        r"([A-Za-z]+)\s+(\d{4})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if month_year:
+        month = _MONTH_NAMES.get(month_year.group(1).casefold())
+        if month:
+            year = int(month_year.group(2))
+            try:
+                return date(year, month, 1).isoformat()
+            except ValueError:
+                return None
+
+    return None
+
+
+def extract_expiration_from_text(text: str) -> str | None:
+    raw = text or ""
+    patterns = [
+        r"\bexp(?:iry|ires|iration)?\.?\s*[:=]?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+        r"\bexp(?:iry|ires|iration)?\.?\s*[:=]?\s*(\d{4}-\d{2}-\d{2})",
+        r"\bexp(?:iry|ires|iration)?\.?\s*[:=]?\s*([A-Za-z]+\s+\d{4})",
+        r"\b(\d{4}-\d{2}-\d{2})\b",
+        r"\b([A-Za-z]+\s+\d{1,2},?\s+\d{4})\b",
+        r"\b([A-Za-z]+\s+\d{4})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if not match:
+            continue
+        normalized = normalize_expiration(match.group(1))
+        if normalized and normalized != "N/A":
+            return normalized
+    return None
+
+
+def is_real_expiration(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text or text.upper() in {"N/A", "NA", "NONE", "NULL", "UNKNOWN", ""}:
+        return False
+    return normalize_expiration(text) not in (None, "N/A")
+
+
 def _is_bad_name(value: Any) -> bool:
     return str(value or "").strip().casefold() in BAD_ITEM_NAMES
 
@@ -304,6 +442,11 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
     if strength:
         item["Unit Size"] = strength.group(1).replace(" ", "")
         provided.add("Unit Size")
+
+    expiration = extract_expiration_from_text(raw)
+    if expiration:
+        item["Expiration Date"] = expiration
+        provided.add("Expiration Date")
 
     name = raw
     for noise in STORAGE_LOCATIONS + ITEM_TYPES + CONTAINER_TYPES:
@@ -505,9 +648,10 @@ class MedicineBotRuntime:
         )
 
         expiration = str(item["Expiration Date"]).strip()
-        if expiration.upper() in {"", "NONE", "NULL", "UNKNOWN"}:
-            expiration = "N/A"
-        item["Expiration Date"] = expiration
+        normalized_exp = normalize_expiration(expiration)
+        item["Expiration Date"] = (
+            normalized_exp if normalized_exp is not None else DEFAULTS["Expiration Date"]
+        )
 
         if not str(item["Reorder Status"]).strip():
             item["Reorder Status"] = DEFAULTS["Reorder Status"]
@@ -882,7 +1026,45 @@ class MedicineBotRuntime:
     ) -> None:
         context.user_data[PENDING_ADD_KEY] = pending
 
-    def _clarify_keyboard(self, field: str) -> InlineKeyboardMarkup | None:
+    def _clarify_keyboard(self, field: str, item: dict[str, Any] | None = None) -> InlineKeyboardMarkup | None:
+        item = item or {}
+        if field in {"Unit Size", "Formula"}:
+            return InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Skip (N/A)", callback_data=f"cf:skip:{field}"
+                        )
+                    ],
+                    [InlineKeyboardButton("Cancel", callback_data="cf:cancel")],
+                ]
+            )
+
+        if field == "Expiration Date":
+            rows: list[list[InlineKeyboardButton]] = []
+            suggested = str(item.get("Expiration Date", "")).strip()
+            if is_real_expiration(suggested):
+                normalized = normalize_expiration(suggested) or suggested
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            f"✅ Keep suggested: {normalized}",
+                            callback_data="cf:exp:keep",
+                        )
+                    ]
+                )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "Skip (N/A)", callback_data="cf:exp:na"
+                    )
+                ]
+            )
+            rows.append(
+                [InlineKeyboardButton("Cancel", callback_data="cf:cancel")]
+            )
+            return InlineKeyboardMarkup(rows)
+
         choices = FIELD_CHOICES.get(field)
         if not choices:
             return None
@@ -949,7 +1131,7 @@ class MedicineBotRuntime:
                 f"Adding *{_escape_md(item.get('Item Name', 'item'))}*\n\n"
                 f"{prompt}"
             )
-            markup = self._clarify_keyboard(field)
+            markup = self._clarify_keyboard(field, item)
 
         if edit_message and update.callback_query:
             await update.callback_query.edit_message_text(
@@ -1007,6 +1189,16 @@ class MedicineBotRuntime:
             item["Unit Size"] = str(value).strip() or "N/A"
         elif field == "Formula":
             item["Formula"] = str(value).strip() or "N/A"
+        elif field == "Expiration Date":
+            if str(value).strip().casefold() in {"keep", "suggested"}:
+                normalized = normalize_expiration(item.get("Expiration Date"))
+            else:
+                normalized = normalize_expiration(value)
+            if normalized is None:
+                raise ValueError(
+                    "Could not read that date. Try `2027-07-23`, `July 2027`, or `N/A`."
+                )
+            item["Expiration Date"] = normalized
         else:
             item[field] = value
 
@@ -1096,6 +1288,18 @@ class MedicineBotRuntime:
             if caption.strip():
                 _, caption_provided = parse_add_text(caption)
                 provided |= caption_provided
+            if is_real_expiration(item.get("Expiration Date")):
+                item["Expiration Date"] = (
+                    normalize_expiration(item["Expiration Date"])
+                    or item["Expiration Date"]
+                )
+                provided.add("Expiration Date")
+            unit = str(item.get("Unit Size") or "").strip()
+            if unit and unit.upper() not in {"N/A", "NA", "UNKNOWN", ""}:
+                provided.add("Unit Size")
+            formula = str(item.get("Formula") or "").strip()
+            if formula and formula.upper() not in {"N/A", "NA", "UNKNOWN", ""}:
+                provided.add("Formula")
         except Exception:
             logger.exception("Photo medicine extraction failed")
             await status.edit_text(
@@ -1308,6 +1512,34 @@ class MedicineBotRuntime:
             await query.edit_message_text(
                 "✅ *Saved*\n\n" + self.format_item_markdown(item),
                 parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        if data.startswith("cf:exp:"):
+            action = data.split(":", 2)[-1]
+            value = "keep" if action == "keep" else "N/A"
+            try:
+                await self._apply_field_answer(context, "Expiration Date", value)
+            except ValueError as exc:
+                await query.edit_message_text(f"❌ {exc}")
+                return
+            await self._prompt_next_clarification(
+                update, context, edit_message=True
+            )
+            return
+
+        if data.startswith("cf:skip:"):
+            field = data[len("cf:skip:") :]
+            if field not in {"Unit Size", "Formula"}:
+                await query.edit_message_text("❌ Unknown skip field.")
+                return
+            try:
+                await self._apply_field_answer(context, field, "N/A")
+            except ValueError as exc:
+                await query.edit_message_text(f"❌ {exc}")
+                return
+            await self._prompt_next_clarification(
+                update, context, edit_message=True
             )
             return
 
