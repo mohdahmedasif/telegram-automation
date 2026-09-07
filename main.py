@@ -1,8 +1,8 @@
 """
-Relay — personal automation control hub.
+Relay — personal automation status hub.
 
-Starts the web UI that lists registered automations. Individual bots
-(e.g. pantry inventory) live under `automations/` and are started from the UI.
+Starts registered automations automatically with the app, then serves a
+read-only status UI. Individual bots live under `automations/`.
 """
 
 from __future__ import annotations

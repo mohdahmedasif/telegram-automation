@@ -1,17 +1,18 @@
-"""FastAPI control surface for listing and starting/stopping automations."""
+"""FastAPI status surface for Relay automations (auto-started on boot)."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app.registry import get_automation, list_automations
+from app.registry import list_automations
 from automations.base import AutomationStatus
 
 logger = logging.getLogger("relay.web")
@@ -20,9 +21,18 @@ WEB_DIR = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(WEB_DIR / "templates"))
 
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    yield
+async def _start_all() -> None:
+    async def _one(automation) -> None:
+        try:
+            await automation.start()
+            logger.info("Started automation %s", automation.id)
+        except Exception:
+            logger.exception("Failed to start automation %s", automation.id)
+
+    await asyncio.gather(*[_one(a) for a in list_automations()])
+
+
+async def _stop_all() -> None:
     for automation in list_automations():
         if automation.status is AutomationStatus.RUNNING:
             try:
@@ -33,10 +43,17 @@ async def lifespan(_app: FastAPI):
                 )
 
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await _start_all()
+    yield
+    await _stop_all()
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Relay",
-        description="Personal automation control hub",
+        description="Personal automation status hub",
         lifespan=lifespan,
     )
     app.mount(
@@ -66,29 +83,5 @@ def create_app() -> FastAPI:
         return JSONResponse(
             [a.info().to_dict() for a in list_automations()]
         )
-
-    @app.post("/api/automations/{automation_id}/start")
-    async def api_start(automation_id: str) -> JSONResponse:
-        automation = get_automation(automation_id)
-        if automation is None:
-            raise HTTPException(status_code=404, detail="Automation not found")
-        try:
-            await automation.start()
-        except Exception as exc:
-            logger.exception("Failed to start %s", automation_id)
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        return JSONResponse(automation.info().to_dict())
-
-    @app.post("/api/automations/{automation_id}/stop")
-    async def api_stop(automation_id: str) -> JSONResponse:
-        automation = get_automation(automation_id)
-        if automation is None:
-            raise HTTPException(status_code=404, detail="Automation not found")
-        try:
-            await automation.stop()
-        except Exception as exc:
-            logger.exception("Failed to stop %s", automation_id)
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        return JSONResponse(automation.info().to_dict())
 
     return app

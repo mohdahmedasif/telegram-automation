@@ -14,7 +14,7 @@
 
   <header class="site-header">
     <p class="brand">Relay</p>
-    <p class="tagline">Your automations, in one place. Start and stop them from here.</p>
+    <p class="tagline">Your automations run with the app. Status only — no manual start or stop.</p>
     <p class="stats">
       <span data-running>{{ running_count }}</span> running
       <span class="dot">·</span>
@@ -47,20 +47,6 @@
           <p class="error-line {% if not item.error %}is-hidden{% endif %}" data-error>
             {{ item.error or "" }}
           </p>
-        </div>
-        <div class="automation-actions">
-          <button
-            type="button"
-            class="btn btn-start"
-            data-action="start"
-            {% if item.status in ['running', 'starting'] %}disabled{% endif %}
-          >Start</button>
-          <button
-            type="button"
-            class="btn btn-stop"
-            data-action="stop"
-            {% if item.status not in ['running', 'error'] %}disabled{% endif %}
-          >Stop</button>
         </div>
       </li>
       {% endfor %}

@@ -24,3 +24,6 @@ Thumbs.db
 *.log
 .pytest_cache/
 .mypy_cache/
+
+# Local process fallback from scripts/restart.sh
+run/

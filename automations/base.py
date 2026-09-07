@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
+
+# Telegram bot tokens look like 123456:AA... — never expose them in UI/API.
+_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
+
+
+def _safe_error(exc: BaseException) -> str:
+    message = str(exc)
+    return _TOKEN_RE.sub("[redacted-token]", message)
 
 
 class AutomationStatus(str, Enum):
@@ -77,7 +86,7 @@ class Automation(ABC):
             self._status = AutomationStatus.RUNNING
         except Exception as exc:
             self._status = AutomationStatus.ERROR
-            self._error = str(exc)
+            self._error = _safe_error(exc)
             raise
 
     async def stop(self) -> None:
@@ -90,7 +99,7 @@ class Automation(ABC):
             self._error = None
         except Exception as exc:
             self._status = AutomationStatus.ERROR
-            self._error = str(exc)
+            self._error = _safe_error(exc)
             raise
 
     @abstractmethod
