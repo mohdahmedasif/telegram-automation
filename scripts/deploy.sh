@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Pull latest main, install deps, restart Relay.
-# Used by GitHub Actions deploy and safe to run manually on the VPS:
-#   bash scripts/update.sh
+# Used by GitHub Actions and safe to run manually on the VPS:
+#   bash scripts/deploy.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -9,7 +9,7 @@ cd "$ROOT"
 
 BRANCH="${RELAY_DEPLOY_BRANCH:-main}"
 
-echo "==> Updating Relay in $ROOT (branch: $BRANCH)"
+echo "==> Deploying Relay in $ROOT (branch: $BRANCH)"
 
 if [ ! -d .git ]; then
   echo "ERROR: $ROOT is not a git repository."
@@ -38,4 +38,4 @@ pip install -r requirements.txt
 echo "==> Restart"
 bash "$ROOT/scripts/restart.sh"
 
-echo "==> Update complete ($(git rev-parse --short HEAD))"
+echo "==> Deploy complete ($(git rev-parse --short HEAD))"

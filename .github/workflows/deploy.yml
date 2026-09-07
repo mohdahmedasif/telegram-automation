@@ -25,4 +25,4 @@ jobs:
           script: |
             set -euo pipefail
             cd "${{ secrets.DEPLOY_PATH }}"
-            bash scripts/update.sh
+            bash scripts/deploy.sh
