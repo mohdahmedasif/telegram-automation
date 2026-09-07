@@ -148,7 +148,43 @@ BOT_COMMANDS = [
     BotCommand("search", "Find items — /search honey"),
     BotCommand("edit", "Edit count/delete — /edit honey"),
     BotCommand("list", "Show recent pantry items"),
+    BotCommand("cancel", "Cancel the current add"),
 ]
+
+# Draft add conversation (stored in context.user_data).
+PENDING_ADD_KEY = "pending_add"
+
+# Ask for these when the user/Gemini did not explicitly provide them.
+CLARIFY_FIELDS = [
+    "Count",
+    "Category",
+    "Storage Location",
+    "Container Type",
+    "Unit Size",
+]
+
+FIELD_CHOICES: dict[str, list[str]] = {
+    "Category": CATEGORIES,
+    "Storage Location": STORAGE_LOCATIONS,
+    "Container Type": CONTAINER_TYPES,
+    "Count": ["1", "2", "3", "4", "5", "6", "8", "10"],
+}
+
+FIELD_PROMPTS = {
+    "Count": "How many do you have?",
+    "Category": "Which category?",
+    "Storage Location": "Where is it stored?",
+    "Container Type": "What container type?",
+    "Unit Size": "What unit size? (e.g. `500g`, `1L`, or `N/A`)",
+}
+
+FIELD_CALLBACK_KEYS = {
+    "Count": "cnt",
+    "Category": "cat",
+    "Storage Location": "loc",
+    "Container Type": "ctr",
+}
+CALLBACK_KEY_TO_FIELD = {v: k for k, v in FIELD_CALLBACK_KEYS.items()}
 
 EXTRACTION_SYSTEM_INSTRUCTION = (
     "Extract pantry item details into a JSON object with keys: Item Name, "
@@ -258,10 +294,16 @@ def _guess_category(name: str) -> str:
 
 
 def item_from_text(text: str) -> dict[str, Any]:
-    """
-    Build a pantry row from plain user text without Gemini.
+    item, _provided = parse_add_text(text)
+    return item
 
-    Supports: "pasta", "pasta 2", "2x pasta", "pasta x2", "add pasta".
+
+def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
+    """
+    Build a pantry draft from plain user text and note which fields were explicit.
+
+    Supports: "pasta", "pasta 2", "2x pasta", "pasta x2", "add pasta",
+    plus optional hints like "basement", "jar", "500g".
     """
     raw = re.sub(r"\s+", " ", (text or "").strip())
     raw = re.sub(r"^(?:add|/add)\s+", "", raw, flags=re.IGNORECASE).strip()
@@ -270,8 +312,10 @@ def item_from_text(text: str) -> dict[str, Any]:
     if is_non_item_message(raw):
         raise ValueError("That looks like a chat message, not a pantry item.")
 
+    provided: set[str] = set()
     count = 1
     name = raw
+    count_explicit = False
 
     patterns = [
         r"^(?P<count>\d+)\s*[x×]\s*(?P<name>.+)$",
@@ -284,9 +328,42 @@ def item_from_text(text: str) -> dict[str, Any]:
         if match:
             name = match.group("name").strip(" -,:;")
             count = max(1, int(match.group("count")))
+            count_explicit = True
             break
 
-    name = name.strip(" -,:;")
+    # Pull known enum/unit tokens out of the remaining name phrase.
+    storage = None
+    container = None
+    unit_size = None
+    tokens = name
+    for loc in STORAGE_LOCATIONS:
+        if re.search(rf"\b{re.escape(loc)}\b", tokens, flags=re.IGNORECASE):
+            storage = loc
+            tokens = re.sub(rf"\b{re.escape(loc)}\b", " ", tokens, flags=re.IGNORECASE)
+            break
+    for cont in CONTAINER_TYPES:
+        singular = cont[:-1] if cont.endswith("s") else cont
+        if re.search(rf"\b{re.escape(cont)}\b", tokens, flags=re.IGNORECASE) or re.search(
+            rf"\b{re.escape(singular)}\b", tokens, flags=re.IGNORECASE
+        ):
+            container = cont
+            tokens = re.sub(
+                rf"\b{re.escape(cont)}\b|\b{re.escape(singular)}\b",
+                " ",
+                tokens,
+                flags=re.IGNORECASE,
+            )
+            break
+    unit_match = re.search(
+        r"(\d+(?:[.,]\d+)?\s*(?:kg|g|l|ml|oz|lb)s?)\b",
+        tokens,
+        flags=re.IGNORECASE,
+    )
+    if unit_match:
+        unit_size = unit_match.group(1).replace(" ", "")
+        tokens = tokens[: unit_match.start()] + " " + tokens[unit_match.end() :]
+
+    name = re.sub(r"\s+", " ", tokens).strip(" -,:;")
     if _is_bad_name(name):
         raise ValueError("Could not determine an item name from that text.")
 
@@ -294,7 +371,43 @@ def item_from_text(text: str) -> dict[str, Any]:
     item["Item Name"] = name.title() if name.islower() else name
     item["Count"] = count
     item["Category"] = _guess_category(name)
-    return item
+    provided.add("Item Name")
+    if count_explicit:
+        provided.add("Count")
+    if storage:
+        item["Storage Location"] = storage
+        provided.add("Storage Location")
+    if container:
+        item["Container Type"] = container
+        provided.add("Container Type")
+    if unit_size:
+        item["Unit Size"] = unit_size
+        provided.add("Unit Size")
+
+    # Only treat category as provided when the user typed a category-ish word.
+    lowered = raw.casefold()
+    for category, words in [
+        ("Grains & Rice", ("rice", "lentil", "grain")),
+        ("Pasta & Noodles", ("pasta", "noodle", "spaghetti")),
+        ("Oils & Condiments", ("oil", "vinegar", "sauce")),
+        ("Canned Goods", ("canned",)),
+        ("Baking", ("baking", "flour", "sugar")),
+        ("Spreads & Jams", ("jam", "honey", "spread")),
+        ("Seasonings & Spices", ("spice", "seasoning", "cinnamon", "garlic")),
+        ("Beverages", ("juice", "tea", "coffee", "drink")),
+    ]:
+        if any(word in lowered for word in words):
+            item["Category"] = category
+            # Still ask unless the full category label was typed.
+            if category.casefold() in lowered:
+                provided.add("Category")
+            break
+
+    return item, provided
+
+
+def missing_clarify_fields(provided: set[str]) -> list[str]:
+    return [field for field in CLARIFY_FIELDS if field not in provided]
 
 
 def local_search(
@@ -592,20 +705,37 @@ class PantryBotRuntime:
 
         return self._normalize_item(parsed, fallback_name=text)
 
-    async def resolve_item_from_text(self, text: str) -> dict[str, Any]:
-        """Prefer Gemini enrichment; always fall back to local parsing."""
-        local_item = item_from_text(text)
+    async def resolve_item_from_text(
+        self, text: str
+    ) -> tuple[dict[str, Any], set[str]]:
+        """Prefer Gemini enrichment; always fall back to local parsing.
+
+        `provided` only includes fields the user explicitly typed — Gemini may
+        suggest values, but missing clarifications are still asked.
+        """
+        local_item, provided = parse_add_text(text)
         try:
             gemini_item = await self.gemini_extract_item(text=text)
             gemini_name = str(gemini_item.get("Item Name") or "")
             if _is_bad_name(gemini_name) or not _names_related(
                 str(local_item["Item Name"]), gemini_name
             ):
-                # Keep the user's words — never let Gemini invent another product.
                 gemini_item["Item Name"] = local_item["Item Name"]
                 gemini_item["Count"] = local_item["Count"]
                 gemini_item["Category"] = local_item["Category"]
-            elif not gemini_item.get("Count"):
+
+            # Explicit user hints always win.
+            for key in (
+                "Count",
+                "Storage Location",
+                "Container Type",
+                "Unit Size",
+            ):
+                if key in provided:
+                    gemini_item[key] = local_item[key]
+            if "Category" in provided:
+                gemini_item["Category"] = local_item["Category"]
+            if not gemini_item.get("Count"):
                 gemini_item["Count"] = local_item["Count"]
 
             notes = str(gemini_item.get("Notes") or "")
@@ -613,14 +743,14 @@ class PantryBotRuntime:
                 r"no item|not provided|unknown|n/?a", notes, flags=re.IGNORECASE
             ):
                 gemini_item["Notes"] = ""
-            return gemini_item
+            return gemini_item, provided | {"Item Name"}
         except Exception:
             logger.warning(
                 "Gemini extract failed; using local parse for %r",
                 text,
                 exc_info=True,
             )
-            return local_item
+            return local_item, provided
 
     @staticmethod
     def format_item_markdown(
@@ -689,6 +819,7 @@ class PantryBotRuntime:
         application.add_handler(CommandHandler("start", self.start_command))
         application.add_handler(CommandHandler("help", self.help_command))
         application.add_handler(CommandHandler("add", self.add_command))
+        application.add_handler(CommandHandler("cancel", self.cancel_command))
         application.add_handler(CommandHandler("search", self.search_command))
         application.add_handler(CommandHandler("edit", self.edit_command))
         application.add_handler(CommandHandler("list", self.list_command))
@@ -765,31 +896,252 @@ class PantryBotRuntime:
             "• `/search <query>` — find items\n"
             "• `/edit <query>` — change count or delete\n"
             "• `/list` — show recent items\n"
+            "• `/cancel` — cancel an add in progress\n"
             "• send a *photo* of a product to add it\n\n"
-            "_Tip: plain chat won't add items — use `/add`._"
+            "_Tip: I'll ask for missing details before saving._"
         )
 
-    async def _save_text_item(
-        self, update: Update, text: str, *, status_prefix: str
-    ) -> None:
-        assert update.message
-        status = await update.message.reply_text(status_prefix)
+    def _clear_pending(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        context.user_data.pop(PENDING_ADD_KEY, None)
 
-        try:
-            item = await self.resolve_item_from_text(text)
-            await asyncio.to_thread(self.sheet_append_item, item)
-        except Exception:
-            logger.exception("Text item creation failed for %r", text)
-            await status.edit_text(
-                "❌ Could not save that item. Try `/add pasta` or "
-                "`/add pasta 2`."
+    def _get_pending(
+        self, context: ContextTypes.DEFAULT_TYPE
+    ) -> dict[str, Any] | None:
+        pending = context.user_data.get(PENDING_ADD_KEY)
+        return pending if isinstance(pending, dict) else None
+
+    def _set_pending(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        item: dict[str, Any],
+        provided: set[str],
+        awaiting: str | None,
+    ) -> None:
+        context.user_data[PENDING_ADD_KEY] = {
+            "item": item,
+            "provided": sorted(provided),
+            "awaiting": awaiting,
+        }
+
+    def _clarify_keyboard(
+        self, field: str, item: dict[str, Any]
+    ) -> InlineKeyboardMarkup | None:
+        if field == "Unit Size":
+            return InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Skip (N/A)", callback_data="cf:u:N/A"
+                        )
+                    ],
+                    [InlineKeyboardButton("Cancel", callback_data="cf:cancel")],
+                ]
+            )
+
+        choices = FIELD_CHOICES.get(field) or []
+        key = FIELD_CALLBACK_KEYS[field]
+        rows: list[list[InlineKeyboardButton]] = []
+        row: list[InlineKeyboardButton] = []
+        for idx, choice in enumerate(choices):
+            row.append(
+                InlineKeyboardButton(
+                    choice, callback_data=f"cf:v:{key}:{idx}"
+                )
+            )
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+
+        suggested = str(item.get(field, "")).strip()
+        if suggested in choices:
+            idx = choices.index(suggested)
+            rows.insert(
+                0,
+                [
+                    InlineKeyboardButton(
+                        f"✅ Keep suggested: {suggested}",
+                        callback_data=f"cf:v:{key}:{idx}",
+                    )
+                ],
+            )
+        rows.append([InlineKeyboardButton("Cancel", callback_data="cf:cancel")])
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def _confirm_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Save to pantry", callback_data="cf:save"
+                    ),
+                    InlineKeyboardButton("❌ Cancel", callback_data="cf:cancel"),
+                ]
+            ]
+        )
+
+    async def _prompt_next_clarification(
+        self,
+        message,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        edit: bool = False,
+    ) -> None:
+        pending = self._get_pending(context)
+        if not pending:
+            return
+        item = pending["item"]
+        provided = set(pending.get("provided") or [])
+        missing = missing_clarify_fields(provided)
+
+        if not missing:
+            pending["awaiting"] = "confirm"
+            self._set_pending(
+                context, item=item, provided=provided, awaiting="confirm"
+            )
+            text = (
+                "Please confirm this item:\n\n"
+                + self.format_item_markdown(item)
+                + "\n\nSave it to the pantry?"
+            )
+            markup = self._confirm_keyboard()
+            if edit:
+                await message.edit_text(
+                    text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
+                )
+            else:
+                await message.reply_text(
+                    text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
+                )
+            return
+
+        field = missing[0]
+        pending["awaiting"] = field
+        self._set_pending(
+            context, item=item, provided=provided, awaiting=field
+        )
+        prompt = (
+            f"Almost there for *{_escape_md(item.get('Item Name', 'item'))}*.\n"
+            f"{FIELD_PROMPTS.get(field, field)}\n\n"
+            f"_Draft so far:_\n{self.format_item_markdown(item)}"
+        )
+        markup = self._clarify_keyboard(field, item)
+        if edit:
+            await message.edit_text(
+                prompt, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
+            )
+        else:
+            await message.reply_text(
+                prompt, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
+            )
+
+    async def _begin_add_flow(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        item: dict[str, Any],
+        provided: set[str],
+        status_message,
+    ) -> None:
+        provided = set(provided) | {"Item Name"}
+        self._set_pending(
+            context, item=item, provided=provided, awaiting=None
+        )
+        missing = missing_clarify_fields(provided)
+        if not missing:
+            self._set_pending(
+                context, item=item, provided=provided, awaiting="confirm"
+            )
+            await status_message.edit_text(
+                "Please confirm this item:\n\n"
+                + self.format_item_markdown(item)
+                + "\n\nSave it to the pantry?",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=self._confirm_keyboard(),
             )
             return
 
-        await status.edit_text(
-            "✅ *Item added to pantry*\n\n" + self.format_item_markdown(item),
+        await status_message.edit_text(
+            f"Got *{_escape_md(item.get('Item Name'))}*. "
+            f"I need {len(missing)} more detail(s) before saving.",
             parse_mode=ParseMode.MARKDOWN,
         )
+        await self._prompt_next_clarification(
+            update.effective_message, context, edit=False
+        )
+
+    async def _apply_field_answer(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        field: str,
+        raw_value: str,
+    ) -> str | None:
+        pending = self._get_pending(context)
+        if not pending:
+            return "Nothing to update — start with `/add <item>`."
+        item = pending["item"]
+        provided = set(pending.get("provided") or [])
+        value = raw_value.strip()
+        if not value:
+            return "Please send a value, or tap a button."
+
+        if field == "Count":
+            match = re.search(r"\d+", value)
+            if not match:
+                return "Send a number for count (e.g. `2`)."
+            item["Count"] = max(0, int(match.group(0)))
+        elif field == "Category":
+            item["Category"] = _coerce_choice(
+                value, CATEGORIES, item.get("Category") or DEFAULTS["Category"]
+            )
+        elif field == "Storage Location":
+            item["Storage Location"] = _coerce_choice(
+                value,
+                STORAGE_LOCATIONS,
+                item.get("Storage Location") or DEFAULTS["Storage Location"],
+            )
+        elif field == "Container Type":
+            item["Container Type"] = _coerce_choice(
+                value,
+                CONTAINER_TYPES,
+                item.get("Container Type") or DEFAULTS["Container Type"],
+            )
+        elif field == "Unit Size":
+            item["Unit Size"] = value
+        else:
+            return f"Unexpected field: {field}"
+
+        provided.add(field)
+        self._set_pending(
+            context, item=item, provided=provided, awaiting=None
+        )
+        return None
+
+    async def _save_pending_item(
+        self, context: ContextTypes.DEFAULT_TYPE
+    ) -> dict[str, Any]:
+        pending = self._get_pending(context)
+        if not pending:
+            raise RuntimeError("No pending item to save.")
+        item = pending["item"]
+        await asyncio.to_thread(self.sheet_append_item, item)
+        self._clear_pending(context)
+        return item
+
+    async def cancel_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not update.message:
+            return
+        if self._get_pending(context):
+            self._clear_pending(context)
+            await update.message.reply_text("Cancelled. Nothing was saved.")
+        else:
+            await update.message.reply_text("Nothing in progress to cancel.")
 
     async def add_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -802,15 +1154,25 @@ class PantryBotRuntime:
                 "Usage: `/add <item>`\nExamples:\n"
                 "• `/add pasta`\n"
                 "• `/add pasta 2`\n"
-                "• `/add 2x olive oil`",
+                "• `/add 2x olive oil kitchen cabinet`",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
-        await self._save_text_item(
-            update,
-            text,
-            status_prefix="➕ Adding item…",
-        )
+
+        status = await update.message.reply_text("➕ Preparing item…")
+        try:
+            self._clear_pending(context)
+            item, provided = await self.resolve_item_from_text(text)
+            await self._begin_add_flow(
+                update, context, item=item, provided=provided, status_message=status
+            )
+        except Exception:
+            logger.exception("Add command failed for %r", text)
+            self._clear_pending(context)
+            await status.edit_text(
+                "❌ Could not start that add. Try `/add pasta` or "
+                "`/add pasta 2`."
+            )
 
     async def _download_best_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -834,42 +1196,116 @@ class PantryBotRuntime:
 
         try:
             image_bytes = await self._download_best_photo(update, context)
+            provided: set[str] = set()
             try:
                 item = await self.gemini_extract_item(
                     text=caption or None, image_bytes=image_bytes
                 )
+                # Photo extraction can fill details; still clarify blanks.
+                provided.add("Item Name")
+                if caption.strip():
+                    _cap_item, cap_provided = parse_add_text(caption)
+                    provided |= cap_provided
+                    for key in cap_provided:
+                        if key in _cap_item:
+                            item[key] = _cap_item[key]
+                unit = str(item.get("Unit Size") or "").strip()
+                if unit and unit.upper() not in {"N/A", "NA", "UNKNOWN", ""}:
+                    provided.add("Unit Size")
+                if item.get("Category") in CATEGORIES:
+                    provided.add("Category")
+                if item.get("Storage Location") in STORAGE_LOCATIONS and (
+                    caption
+                    and any(
+                        loc.casefold() in caption.casefold()
+                        for loc in STORAGE_LOCATIONS
+                    )
+                ):
+                    provided.add("Storage Location")
+                if item.get("Container Type") in CONTAINER_TYPES:
+                    provided.add("Container Type")
+                if item.get("Count") not in (None, "", 0):
+                    # Count from photo alone is a guess — only trust caption count.
+                    if "Count" in provided:
+                        pass
+                    else:
+                        # leave Count for clarification unless caption had it
+                        pass
             except Exception:
                 if caption.strip():
                     logger.warning(
                         "Gemini photo extract failed; falling back to caption",
                         exc_info=True,
                     )
-                    item = item_from_text(caption)
+                    item, provided = parse_add_text(caption)
                 else:
                     raise
-            await asyncio.to_thread(self.sheet_append_item, item)
+            await self._begin_add_flow(
+                update,
+                context,
+                item=item,
+                provided=provided,
+                status_message=status,
+            )
         except Exception:
             logger.exception("Photo item creation failed")
+            self._clear_pending(context)
             await status.edit_text(
-                "❌ Could not extract or save the item from that photo. "
-                "Please try again with a clearer image or add a caption "
-                "(or use `/add <item>`)."
+                "❌ Could not extract that photo. "
+                "Try a clearer image, a caption, or `/add <item>`."
             )
-            return
-
-        await status.edit_text(
-            "✅ *Item added to pantry*\n\n" + self.format_item_markdown(item),
-            parse_mode=ParseMode.MARKDOWN,
-        )
 
     async def handle_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Free text is conversation only — never auto-adds to the sheet."""
+        """Free text is conversation — answers clarifications, else shows options."""
         if not update.message or not update.message.text:
             return
 
         text = update.message.text.strip()
+        pending = self._get_pending(context)
+        if pending:
+            awaiting = pending.get("awaiting")
+            if awaiting == "confirm":
+                lowered = text.casefold()
+                if lowered in {"yes", "y", "save", "ok", "okay"}:
+                    try:
+                        item = await self._save_pending_item(context)
+                    except Exception:
+                        logger.exception("Failed saving confirmed item")
+                        await update.message.reply_text(
+                            "❌ Save failed. Please try `/add` again."
+                        )
+                        return
+                    await update.message.reply_text(
+                        "✅ *Item added to pantry*\n\n"
+                        + self.format_item_markdown(item),
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    return
+                if lowered in {"no", "n", "cancel", "stop"}:
+                    self._clear_pending(context)
+                    await update.message.reply_text(
+                        "Cancelled. Nothing was saved."
+                    )
+                    return
+                await update.message.reply_text(
+                    "Please tap *Save* / *Cancel*, or reply `yes` / `no`.",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=self._confirm_keyboard(),
+                )
+                return
+
+            if awaiting in CLARIFY_FIELDS:
+                error = await self._apply_field_answer(context, awaiting, text)
+                if error:
+                    await update.message.reply_text(error)
+                    return
+                await self._prompt_next_clarification(
+                    update.message, context, edit=False
+                )
+                return
+
         greeting = is_non_item_message(text) or bool(
             re.match(
                 r"^(hi+|hello|hey|howdy|what'?s up|what u do|what do you do|"
@@ -1008,6 +1444,72 @@ class PantryBotRuntime:
 
         await query.answer()
         data = query.data
+
+        if data.startswith("cf:"):
+            try:
+                if data == "cf:cancel":
+                    self._clear_pending(context)
+                    await query.edit_message_text(
+                        "Cancelled. Nothing was saved."
+                    )
+                    return
+
+                if data == "cf:save":
+                    item = await self._save_pending_item(context)
+                    await query.edit_message_text(
+                        "✅ *Item added to pantry*\n\n"
+                        + self.format_item_markdown(item),
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    return
+
+                if data.startswith("cf:u:"):
+                    value = data[5:] or "N/A"
+                    error = await self._apply_field_answer(
+                        context, "Unit Size", value
+                    )
+                    if error:
+                        await query.edit_message_text(error)
+                        return
+                    await self._prompt_next_clarification(
+                        query.message, context, edit=True
+                    )
+                    return
+
+                match = re.fullmatch(r"cf:v:([a-z]+):(\d+)", data)
+                if match:
+                    key, idx_s = match.groups()
+                    field = CALLBACK_KEY_TO_FIELD.get(key)
+                    if not field:
+                        await query.edit_message_text("❌ Unknown field.")
+                        return
+                    choices = FIELD_CHOICES.get(field) or []
+                    idx = int(idx_s)
+                    if idx < 0 or idx >= len(choices):
+                        await query.edit_message_text("❌ Invalid choice.")
+                        return
+                    error = await self._apply_field_answer(
+                        context, field, choices[idx]
+                    )
+                    if error:
+                        await query.edit_message_text(error)
+                        return
+                    await self._prompt_next_clarification(
+                        query.message, context, edit=True
+                    )
+                    return
+
+                await query.edit_message_text("❌ Unknown action.")
+            except Exception:
+                logger.exception("Clarify callback failed: %s", data)
+                self._clear_pending(context)
+                try:
+                    await query.edit_message_text(
+                        "❌ Something went wrong. Please `/add` again."
+                    )
+                except Exception:
+                    logger.debug("Could not edit clarify callback", exc_info=True)
+            return
 
         match = re.fullmatch(r"(inc|dec|del)_(\d+)", data)
         if not match:
