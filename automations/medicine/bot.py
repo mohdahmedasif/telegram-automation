@@ -939,7 +939,7 @@ class MedicineBotRuntime:
                     pool_timeout=30.0,
                 )
             )
-            .concurrent_updates(True)
+            .concurrent_updates(False)
             .build()
         )
 
