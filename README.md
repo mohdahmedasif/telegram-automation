@@ -150,11 +150,18 @@ sudo ./svc.sh start
 ```
 
 Optional secret: `DEPLOY_PATH` = full path to the repo on the VPS  
-(e.g. `/home/ubuntu/telegram-automation`). If unset, the runner looks in `$HOME/telegram-automation`.
+(e.g. `/home/ubuntu/telegram-automation`). If unset, defaults to `$HOME/telegram-automation`.
 
 ### 3. Deploy
 
 Push to `main`, or **Actions → Deploy → Run workflow**.
+
+You can also run manually on the server anytime:
+
+```bash
+cd ~/telegram-automation
+bash scripts/deploy.sh
+```
 
 ## License
 

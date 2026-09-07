@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pull latest main, install deps, restart Relay.
-# Used by GitHub Actions and safe to run manually on the VPS:
+# Used by GitHub Actions (self-hosted) and safe to run manually on the VPS:
 #   bash scripts/deploy.sh
 set -euo pipefail
 

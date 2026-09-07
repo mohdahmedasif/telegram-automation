@@ -12,7 +12,7 @@ concurrency:
 jobs:
   deploy:
     name: Pull and update on VPS
-    # Runs on your VPS runner (label: self-hosted). No SSH key required.
+    # Runs on your VPS (label: self-hosted). Uses scripts/deploy.sh only.
     runs-on: self-hosted
     steps:
       - name: Deploy (git pull + install + restart)
@@ -20,14 +20,14 @@ jobs:
           set -euo pipefail
           APP_DIR="${{ secrets.DEPLOY_PATH }}"
           if [ -z "$APP_DIR" ]; then
-            APP_DIR="$GITHUB_WORKSPACE"
+            APP_DIR="$HOME/telegram-automation"
           fi
           if [ -d "$APP_DIR/.git" ]; then
             cd "$APP_DIR"
-          elif [ -d "$HOME/telegram-automation/.git" ]; then
-            cd "$HOME/telegram-automation"
+          elif [ -d "$GITHUB_WORKSPACE/.git" ]; then
+            cd "$GITHUB_WORKSPACE"
           else
-            echo "Set DEPLOY_PATH secret to your repo folder on the VPS."
+            echo "Set DEPLOY_PATH to your repo folder on the VPS."
             exit 1
           fi
           bash scripts/deploy.sh
