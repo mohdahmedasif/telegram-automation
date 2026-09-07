@@ -152,14 +152,15 @@ Settings → Secrets and variables → Actions:
 | `DEPLOY_PATH` | `/home/ubuntu/telegram-automation` |
 | `DEPLOY_PORT` | `22` (optional) |
 
-Paste the **entire private key** into `DEPLOY_SSH_KEY` (BEGIN through END, no leading spaces).  
-Put the matching `.pub` in the VPS `~/.ssh/authorized_keys`.
-
-Optional: if multiline paste keeps failing, you may instead store **base64** of the key file:
+Paste is unreliable. Prefer setting the secret **from the key file**:
 
 ```powershell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("deploy_relay")) | Set-Clipboard
+# Windows — creates secret without copy/paste mangling
+Get-Content -Raw $env:USERPROFILE\.ssh\github-actions-relay | gh secret set DEPLOY_SSH_KEY --repo mohdahmedasif/telegram-automation
 ```
+
+Or paste the **entire private key** into `DEPLOY_SSH_KEY` (BEGIN through END, no leading spaces).  
+Put the matching `.pub` in the VPS `~/.ssh/authorized_keys`.
 
 ### 3. Deploy
 
