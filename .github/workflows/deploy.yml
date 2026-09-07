@@ -15,31 +15,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Prepare SSH private key
+        env:
+          # Passed via env so multiline PEM keeps real newlines
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
 
-          RAW='${{ secrets.DEPLOY_SSH_KEY }}'
-          if [ -z "$RAW" ]; then
+          if [ -z "${SSH_KEY:-}" ]; then
             echo "DEPLOY_SSH_KEY secret is empty."
             exit 1
           fi
 
-          # Prefer base64 (recommended). Fall back to raw PEM if pasted with BEGIN.
-          if printf '%s' "$RAW" | grep -q 'BEGIN.*PRIVATE KEY'; then
-            printf '%s\n' "$RAW" | tr -d '\r' > ~/.ssh/deploy_key
-          else
-            printf '%s' "$RAW" | tr -d '\r\n ' | base64 -d > ~/.ssh/deploy_key
+          # Strip Windows CR; write exact secret bytes
+          printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key
+
+          # If the secret is base64 (no PEM header), decode it
+          if ! grep -q 'BEGIN.*PRIVATE KEY' ~/.ssh/deploy_key; then
+            tr -d '\n\r ' < ~/.ssh/deploy_key | base64 -d > ~/.ssh/deploy_key.bin
+            mv ~/.ssh/deploy_key.bin ~/.ssh/deploy_key
           fi
 
           chmod 600 ~/.ssh/deploy_key
 
           if ! ssh-keygen -y -f ~/.ssh/deploy_key >/dev/null 2>&1; then
-            echo "DEPLOY_SSH_KEY could not be parsed."
-            echo "Store it as base64 of the private key file (see README)."
+            echo "DEPLOY_SSH_KEY could not be parsed as a private key."
+            echo "Paste the full private key (BEGIN…END), or a base64 of that file."
             exit 1
           fi
+
+          echo "SSH private key OK"
 
       - name: SSH — git pull + install + restart
         uses: appleboy/ssh-action@v1.2.0

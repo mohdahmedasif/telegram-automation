@@ -148,24 +148,18 @@ Settings → Secrets and variables → Actions:
 |--------|---------|
 | `DEPLOY_HOST` | `203.0.113.10` or `vps.example.com` |
 | `DEPLOY_USER` | `ubuntu` |
-| `DEPLOY_SSH_KEY` | **base64** of the private key file (see below) |
+| `DEPLOY_SSH_KEY` | full private key (`-----BEGIN … KEY-----`) |
 | `DEPLOY_PATH` | `/home/ubuntu/telegram-automation` |
 | `DEPLOY_PORT` | `22` (optional) |
 
-**Create `DEPLOY_SSH_KEY` (base64 — avoids GitHub mangling newlines):**
+Paste the **entire private key** into `DEPLOY_SSH_KEY` (BEGIN through END, no leading spaces).  
+Put the matching `.pub` in the VPS `~/.ssh/authorized_keys`.
+
+Optional: if multiline paste keeps failing, you may instead store **base64** of the key file:
 
 ```powershell
-# Windows PowerShell (from the folder with your private key file)
 [Convert]::ToBase64String([IO.File]::ReadAllBytes("deploy_relay")) | Set-Clipboard
 ```
-
-```bash
-# macOS / Linux
-base64 -w0 deploy_relay | pbcopy   # or: base64 -w0 deploy_relay
-```
-
-Paste that **single line** into the `DEPLOY_SSH_KEY` secret (not the raw PEM).
-Put the matching `.pub` key in the VPS `~/.ssh/authorized_keys`.
 
 ### 3. Deploy
 
