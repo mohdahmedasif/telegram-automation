@@ -313,8 +313,49 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
         raise ValueError("That looks like a chat message, not a pantry item.")
 
     provided: set[str] = set()
+    working = raw
+
+    storage = None
+    container = None
+    unit_size = None
+
+    for loc in STORAGE_LOCATIONS:
+        if re.search(rf"\b{re.escape(loc)}\b", working, flags=re.IGNORECASE):
+            storage = loc
+            working = re.sub(
+                rf"\b{re.escape(loc)}\b", " ", working, flags=re.IGNORECASE
+            )
+            provided.add("Storage Location")
+            break
+
+    for cont in CONTAINER_TYPES:
+        singular = cont[:-1] if cont.endswith("s") else cont
+        if re.search(rf"\b{re.escape(cont)}\b", working, flags=re.IGNORECASE) or re.search(
+            rf"\b{re.escape(singular)}\b", working, flags=re.IGNORECASE
+        ):
+            container = cont
+            working = re.sub(
+                rf"\b{re.escape(cont)}\b|\b{re.escape(singular)}\b",
+                " ",
+                working,
+                flags=re.IGNORECASE,
+            )
+            provided.add("Container Type")
+            break
+
+    unit_match = re.search(
+        r"(\d+(?:[.,]\d+)?\s*(?:kg|g|l|ml|oz|lb)s?)\b",
+        working,
+        flags=re.IGNORECASE,
+    )
+    if unit_match:
+        unit_size = unit_match.group(1).replace(" ", "")
+        working = working[: unit_match.start()] + " " + working[unit_match.end() :]
+        provided.add("Unit Size")
+
+    working = re.sub(r"\s+", " ", working).strip(" -,:;")
     count = 1
-    name = raw
+    name = working
     count_explicit = False
 
     patterns = [
@@ -324,46 +365,14 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
         r"^(?P<count>\d+)\s+(?P<name>.+)$",
     ]
     for pattern in patterns:
-        match = re.fullmatch(pattern, raw, flags=re.IGNORECASE)
+        match = re.fullmatch(pattern, working, flags=re.IGNORECASE)
         if match:
             name = match.group("name").strip(" -,:;")
             count = max(1, int(match.group("count")))
             count_explicit = True
             break
 
-    # Pull known enum/unit tokens out of the remaining name phrase.
-    storage = None
-    container = None
-    unit_size = None
-    tokens = name
-    for loc in STORAGE_LOCATIONS:
-        if re.search(rf"\b{re.escape(loc)}\b", tokens, flags=re.IGNORECASE):
-            storage = loc
-            tokens = re.sub(rf"\b{re.escape(loc)}\b", " ", tokens, flags=re.IGNORECASE)
-            break
-    for cont in CONTAINER_TYPES:
-        singular = cont[:-1] if cont.endswith("s") else cont
-        if re.search(rf"\b{re.escape(cont)}\b", tokens, flags=re.IGNORECASE) or re.search(
-            rf"\b{re.escape(singular)}\b", tokens, flags=re.IGNORECASE
-        ):
-            container = cont
-            tokens = re.sub(
-                rf"\b{re.escape(cont)}\b|\b{re.escape(singular)}\b",
-                " ",
-                tokens,
-                flags=re.IGNORECASE,
-            )
-            break
-    unit_match = re.search(
-        r"(\d+(?:[.,]\d+)?\s*(?:kg|g|l|ml|oz|lb)s?)\b",
-        tokens,
-        flags=re.IGNORECASE,
-    )
-    if unit_match:
-        unit_size = unit_match.group(1).replace(" ", "")
-        tokens = tokens[: unit_match.start()] + " " + tokens[unit_match.end() :]
-
-    name = re.sub(r"\s+", " ", tokens).strip(" -,:;")
+    name = name.strip(" -,:;")
     if _is_bad_name(name):
         raise ValueError("Could not determine an item name from that text.")
 
@@ -376,15 +385,11 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
         provided.add("Count")
     if storage:
         item["Storage Location"] = storage
-        provided.add("Storage Location")
     if container:
         item["Container Type"] = container
-        provided.add("Container Type")
     if unit_size:
         item["Unit Size"] = unit_size
-        provided.add("Unit Size")
 
-    # Only treat category as provided when the user typed a category-ish word.
     lowered = raw.casefold()
     for category, words in [
         ("Grains & Rice", ("rice", "lentil", "grain")),
@@ -398,7 +403,6 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
     ]:
         if any(word in lowered for word in words):
             item["Category"] = category
-            # Still ask unless the full category label was typed.
             if category.casefold() in lowered:
                 provided.add("Category")
             break
