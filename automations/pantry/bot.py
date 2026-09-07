@@ -97,6 +97,49 @@ BAD_ITEM_NAMES = {
     "product",
 }
 
+# Casual chat must never become pantry rows.
+CHAT_MESSAGES = {
+    "hi",
+    "hii",
+    "hiii",
+    "hello",
+    "hey",
+    "heya",
+    "hiya",
+    "yo",
+    "sup",
+    "hola",
+    "hallo",
+    "thanks",
+    "thank you",
+    "thx",
+    "ty",
+    "ok",
+    "okay",
+    "k",
+    "kk",
+    "bye",
+    "goodbye",
+    "good morning",
+    "good night",
+    "good evening",
+    "gm",
+    "gn",
+    "test",
+    "testing",
+    "help",
+    "start",
+    "please",
+    "yes",
+    "no",
+    "yep",
+    "nope",
+    "cool",
+    "nice",
+    "lol",
+    "haha",
+}
+
 BOT_COMMANDS = [
     BotCommand("start", "Show help and commands"),
     BotCommand("help", "Show help and commands"),
@@ -165,6 +208,36 @@ def _is_bad_name(value: Any) -> bool:
     return str(value or "").strip().casefold() in BAD_ITEM_NAMES
 
 
+def is_non_item_message(text: str) -> bool:
+    """True for greetings/chat that should not create inventory rows."""
+    cleaned = re.sub(r"[!?.,🙂😀😊👋🙏❤️]+", " ", (text or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().casefold()
+    if not cleaned:
+        return True
+    if cleaned in CHAT_MESSAGES:
+        return True
+    if len(cleaned) <= 1:
+        return True
+    if not re.search(r"[a-z0-9]", cleaned):
+        return True
+    return False
+
+
+def _names_related(user_name: str, other_name: str) -> bool:
+    """Reject Gemini inventing a different product than what the user typed."""
+    user = str(user_name or "").casefold().strip()
+    other = str(other_name or "").casefold().strip()
+    if not user or not other:
+        return False
+    if user in other or other in user:
+        return True
+    user_tokens = {t for t in re.split(r"[^\w]+", user) if len(t) > 2}
+    other_tokens = {t for t in re.split(r"[^\w]+", other) if len(t) > 2}
+    if user_tokens and user_tokens & other_tokens:
+        return True
+    return SequenceMatcher(None, user, other).ratio() >= 0.55
+
+
 def _guess_category(name: str) -> str:
     lowered = name.casefold()
     keywords = [
@@ -193,6 +266,8 @@ def item_from_text(text: str) -> dict[str, Any]:
     raw = re.sub(r"^(?:add|/add)\s+", "", raw, flags=re.IGNORECASE).strip()
     if not raw:
         raise ValueError("Empty item description.")
+    if is_non_item_message(raw):
+        raise ValueError("That looks like a chat message, not a pantry item.")
 
     count = 1
     name = raw
@@ -521,11 +596,22 @@ class PantryBotRuntime:
         local_item = item_from_text(text)
         try:
             gemini_item = await self.gemini_extract_item(text=text)
-            # Keep Gemini details, but never allow a worse/blank name.
-            if _is_bad_name(gemini_item.get("Item Name")):
+            gemini_name = str(gemini_item.get("Item Name") or "")
+            if _is_bad_name(gemini_name) or not _names_related(
+                str(local_item["Item Name"]), gemini_name
+            ):
+                # Keep the user's words — never let Gemini invent another product.
                 gemini_item["Item Name"] = local_item["Item Name"]
-            if not gemini_item.get("Count"):
                 gemini_item["Count"] = local_item["Count"]
+                gemini_item["Category"] = local_item["Category"]
+            elif not gemini_item.get("Count"):
+                gemini_item["Count"] = local_item["Count"]
+
+            notes = str(gemini_item.get("Notes") or "")
+            if re.search(
+                r"no item|not provided|unknown|n/?a", notes, flags=re.IGNORECASE
+            ):
+                gemini_item["Notes"] = ""
             return gemini_item
         except Exception:
             logger.warning(
@@ -756,9 +842,23 @@ class PantryBotRuntime:
     ) -> None:
         if not update.message or not update.message.text:
             return
+
+        text = update.message.text.strip()
+        if is_non_item_message(text):
+            await update.message.reply_text(
+                "👋 Hi! I only add pantry items.\n\n"
+                "Try:\n"
+                "• `/add pasta`\n"
+                "• `/search honey`\n"
+                "• `/edit rice`\n"
+                "• or send a product photo",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
         await self._save_text_item(
             update,
-            update.message.text,
+            text,
             status_prefix="➕ Adding item…",
         )
 
