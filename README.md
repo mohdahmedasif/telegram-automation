@@ -115,13 +115,12 @@ Row 1 = headers; data starts at row 2.
 
 It will appear automatically in the Relay UI.
 
-## Auto-deploy (GitHub Actions on your VPS)
+## Auto-deploy (GitHub Actions → VPS over SSH)
 
-On every push to `main`, GitHub runs [`scripts/deploy.sh`](scripts/deploy.sh) **on your VPS** via a self-hosted runner (git pull → pip install → restart).
+On every push to `main`, GitHub SSHs into your VPS and runs [`scripts/deploy.sh`](scripts/deploy.sh)
+(git pull → pip install → restart).
 
-No SSH deploy key is required — the job already runs on the server.
-
-### 1. One-time: install the app on the VPS
+### 1. One-time: app on the VPS
 
 ```bash
 git clone https://github.com/mohdahmedasif/telegram-automation.git
@@ -132,34 +131,35 @@ pip install -r requirements.txt
 cp .env.example .env   # fill secrets + credentials.json
 
 sudo cp deploy/relay.service /etc/systemd/system/relay.service
-# edit User= / paths in that file
+# edit User= / paths
 sudo systemctl daemon-reload
 sudo systemctl enable --now relay
 ```
 
-### 2. One-time: add a self-hosted runner (on the VPS)
+Make sure your deploy public key is in `~/.ssh/authorized_keys` on the VPS.
 
-In GitHub: **Settings → Actions → Runners → New self-hosted runner**  
-Pick **Linux**, then run the commands GitHub shows on the VPS (download, `./config.sh`, `./run.sh`).
+### 2. GitHub secrets
 
-For a background service after config:
+| Secret | Meaning |
+|--------|---------|
+| `DEPLOY_HOST` | VPS IP / hostname |
+| `DEPLOY_USER` | SSH user |
+| `DEPLOY_PATH` | Full path to the repo on the VPS |
+| `DEPLOY_SSH_KEY` | Private key (**set from file**, see below) |
+| `DEPLOY_PORT` | Optional (default 22) |
 
-```bash
-sudo ./svc.sh install
-sudo ./svc.sh start
+```powershell
+# Windows — set key from file (no paste)
+Get-Content -Raw $env:USERPROFILE\.ssh\github-actions | gh secret set DEPLOY_SSH_KEY --repo mohdahmedasif/telegram-automation
 ```
-
-Optional secret: `DEPLOY_PATH` = full path to the repo on the VPS  
-(e.g. `/home/ubuntu/telegram-automation`). If unset, defaults to `$HOME/telegram-automation`.
 
 ### 3. Deploy
 
 Push to `main`, or **Actions → Deploy → Run workflow**.
 
-You can also run manually on the server anytime:
+Manual on the server:
 
 ```bash
-cd ~/telegram-automation
 bash scripts/deploy.sh
 ```
 

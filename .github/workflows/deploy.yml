@@ -11,23 +11,43 @@ concurrency:
 
 jobs:
   deploy:
-    name: Pull and update on VPS
-    # Runs on your VPS (label: self-hosted). Uses scripts/deploy.sh only.
-    runs-on: self-hosted
+    name: SSH deploy to VPS
+    runs-on: ubuntu-latest
     steps:
-      - name: Deploy (git pull + install + restart)
+      - name: Prepare SSH private key
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
         run: |
           set -euo pipefail
-          APP_DIR="${{ secrets.DEPLOY_PATH }}"
-          if [ -z "$APP_DIR" ]; then
-            APP_DIR="$HOME/telegram-automation"
-          fi
-          if [ -d "$APP_DIR/.git" ]; then
-            cd "$APP_DIR"
-          elif [ -d "$GITHUB_WORKSPACE/.git" ]; then
-            cd "$GITHUB_WORKSPACE"
-          else
-            echo "Set DEPLOY_PATH to your repo folder on the VPS."
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          if [ -z "${SSH_KEY:-}" ]; then
+            echo "DEPLOY_SSH_KEY is empty. Set it with:"
+            echo "  Get-Content -Raw \$env:USERPROFILE\\.ssh\\github-actions | gh secret set DEPLOY_SSH_KEY"
             exit 1
           fi
-          bash scripts/deploy.sh
+
+          printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          if ! ssh-keygen -y -f ~/.ssh/deploy_key >/dev/null 2>&1; then
+            echo "DEPLOY_SSH_KEY is not a valid private key."
+            echo "Set it from the key FILE (do not paste):"
+            echo "  Get-Content -Raw \$env:USERPROFILE\\.ssh\\github-actions | gh secret set DEPLOY_SSH_KEY"
+            exit 1
+          fi
+          echo "SSH private key OK"
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key_path: /home/runner/.ssh/deploy_key
+          port: ${{ secrets.DEPLOY_PORT }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd "${{ secrets.DEPLOY_PATH }}"
+            bash scripts/deploy.sh
