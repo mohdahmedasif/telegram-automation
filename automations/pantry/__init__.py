@@ -9,8 +9,9 @@ class PantryAutomation(Automation):
     id = "pantry"
     name = "Pantry Inventory"
     description = (
-        "Telegram bot that adds pantry items from photos or text via Gemini, "
-        "stores them in Google Sheets, and supports fuzzy /search with "
+        "Telegram bot with /add, /search, /edit, /list. Adds items from "
+        "text or photos (Gemini when available, local fallback otherwise), "
+        "stores them in Google Sheets, and supports fuzzy search with "
         "inline count and delete controls."
     )
     tags = ["telegram", "gemini", "google-sheets", "inventory"]

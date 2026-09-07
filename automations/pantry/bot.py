@@ -11,12 +11,13 @@ import json
 import logging
 import os
 import re
+from difflib import SequenceMatcher
 from typing import Any
 
 import gspread
 from google import genai
 from google.genai import types
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -46,7 +47,6 @@ SHEET_HEADERS = [
 ]
 
 # Allowed values from Google Sheets data-validation dropdowns.
-# Category list may be incomplete (sheet UI was scrolled); add more as needed.
 CATEGORIES = [
     "Grains & Rice",
     "Oils & Condiments",
@@ -55,7 +55,7 @@ CATEGORIES = [
     "Baking",
     "Spreads & Jams",
     "Seasonings & Spices",
-    "Beverages",  # present in existing sheet rows
+    "Beverages",
 ]
 
 STORAGE_LOCATIONS = [
@@ -74,7 +74,7 @@ CONTAINER_TYPES = [
 ]
 
 DEFAULTS = {
-    "Item Name": "Unknown Item",
+    "Item Name": "",
     "Category": "Canned Goods",
     "Storage Location": "Kitchen Cabinet",
     "Count": 1,
@@ -85,10 +85,33 @@ DEFAULTS = {
     "Notes": "",
 }
 
+BAD_ITEM_NAMES = {
+    "",
+    "unknown",
+    "unknown item",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "item",
+    "product",
+}
+
+BOT_COMMANDS = [
+    BotCommand("start", "Show help and commands"),
+    BotCommand("help", "Show help and commands"),
+    BotCommand("add", "Add item — /add pasta"),
+    BotCommand("search", "Find items — /search honey"),
+    BotCommand("edit", "Edit count/delete — /edit honey"),
+    BotCommand("list", "Show recent pantry items"),
+]
+
 EXTRACTION_SYSTEM_INSTRUCTION = (
     "Extract pantry item details into a JSON object with keys: Item Name, "
     "Category, Storage Location, Count, Container Type, Unit Size, "
     "Reorder Status, Expiration Date, Notes.\n"
+    "Item Name MUST be a real product/food name from the user text or image. "
+    "Never use Unknown, N/A, or placeholders for Item Name.\n"
     f"Category MUST be exactly one of: {', '.join(CATEGORIES)}.\n"
     f"Storage Location MUST be exactly one of: {', '.join(STORAGE_LOCATIONS)}. "
     "Default to 'Kitchen Cabinet' unless the user/image clearly specifies another.\n"
@@ -138,14 +161,111 @@ def _coerce_choice(value: Any, allowed: list[str], default: str) -> str:
     return default
 
 
-SEARCH_SYSTEM_INSTRUCTION = (
-    "You match pantry search queries against an inventory list. Prefer fuzzy "
-    "and natural-language matches (e.g. 'honey' → 'Liquid Forest Honey', "
-    "'cinnamon' → 'Ground Cinnamon'). Return only relevant matches. "
-    "Respond with JSON: {\"matches\": [{\"row_index\": <int>, \"reason\": <str>}]}. "
-    "row_index must be the Google Sheets 1-based row number provided in the "
-    "inventory. If nothing matches, return {\"matches\": []}."
-)
+def _is_bad_name(value: Any) -> bool:
+    return str(value or "").strip().casefold() in BAD_ITEM_NAMES
+
+
+def _guess_category(name: str) -> str:
+    lowered = name.casefold()
+    keywords = [
+        ("Pasta & Noodles", ("pasta", "noodle", "spaghetti", "macaroni", "penne")),
+        ("Grains & Rice", ("rice", "lentil", "bean", "grain", "quinoa", "flour")),
+        ("Oils & Condiments", ("oil", "vinegar", "sauce", "ketchup", "mayo")),
+        ("Canned Goods", ("can", "canned", "olive", "jalape")),
+        ("Baking", ("sugar", "baking", "yeast", "cocoa")),
+        ("Spreads & Jams", ("jam", "honey", "spread", "nutella", "butter")),
+        ("Seasonings & Spices", ("spice", "cinnamon", "garlic", "pepper", "salt", "ginger")),
+        ("Beverages", ("juice", "tea", "coffee", "water", "soda", "drink")),
+    ]
+    for category, words in keywords:
+        if any(word in lowered for word in words):
+            return category
+    return DEFAULTS["Category"]
+
+
+def item_from_text(text: str) -> dict[str, Any]:
+    """
+    Build a pantry row from plain user text without Gemini.
+
+    Supports: "pasta", "pasta 2", "2x pasta", "pasta x2", "add pasta".
+    """
+    raw = re.sub(r"\s+", " ", (text or "").strip())
+    raw = re.sub(r"^(?:add|/add)\s+", "", raw, flags=re.IGNORECASE).strip()
+    if not raw:
+        raise ValueError("Empty item description.")
+
+    count = 1
+    name = raw
+
+    patterns = [
+        r"^(?P<count>\d+)\s*[x×]\s*(?P<name>.+)$",
+        r"^(?P<name>.+?)\s*[x×]\s*(?P<count>\d+)$",
+        r"^(?P<name>.+?)\s+(?P<count>\d+)$",
+        r"^(?P<count>\d+)\s+(?P<name>.+)$",
+    ]
+    for pattern in patterns:
+        match = re.fullmatch(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            name = match.group("name").strip(" -,:;")
+            count = max(1, int(match.group("count")))
+            break
+
+    name = name.strip(" -,:;")
+    if _is_bad_name(name):
+        raise ValueError("Could not determine an item name from that text.")
+
+    item = dict(DEFAULTS)
+    item["Item Name"] = name.title() if name.islower() else name
+    item["Count"] = count
+    item["Category"] = _guess_category(name)
+    return item
+
+
+def local_search(
+    query: str, inventory: list[dict[str, Any]], *, limit: int = 12
+) -> list[dict[str, Any]]:
+    """Fuzzy/local inventory search — no Gemini required."""
+    q = re.sub(r"\s+", " ", (query or "").strip().casefold())
+    if not q or not inventory:
+        return []
+
+    tokens = [t for t in re.split(r"[^\w]+", q) if len(t) > 1]
+    scored: list[tuple[float, dict[str, Any]]] = []
+
+    for entry in inventory:
+        name = str(entry.get("Item Name") or "")
+        name_cf = name.casefold()
+        category = str(entry.get("Category") or "").casefold()
+        notes = str(entry.get("Notes") or "").casefold()
+
+        if q == name_cf:
+            score = 300.0
+        elif q in name_cf:
+            score = 220.0
+        else:
+            name_token_hits = sum(1 for t in tokens if t in name_cf)
+            if name_token_hits:
+                score = 150.0 + name_token_hits * 25.0
+                score += SequenceMatcher(None, q, name_cf).ratio() * 40.0
+            elif q in notes or any(t in notes for t in tokens):
+                score = 90.0
+            elif q in category or any(t in category for t in tokens):
+                # Category-only matches rank lower than name hits.
+                score = 70.0
+            else:
+                ratio = SequenceMatcher(None, q, name_cf).ratio()
+                if ratio < 0.58:
+                    continue
+                score = 40.0 + (ratio * 80.0)
+
+        scored.append((score, entry))
+
+    scored.sort(key=lambda pair: (-pair[0], str(pair[1].get("Item Name") or "")))
+    # Prefer real name hits; only fall back to category-only when nothing named matches.
+    strong = [entry for score, entry in scored if score >= 150]
+    if strong:
+        return strong[:limit]
+    return [entry for _, entry in scored[:limit]]
 
 
 def _env(name: str, default: str = "") -> str:
@@ -237,7 +357,9 @@ class PantryBotRuntime:
         )
         return sheet
 
-    def _normalize_item(self, raw: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_item(
+        self, raw: dict[str, Any], *, fallback_name: str | None = None
+    ) -> dict[str, Any]:
         item: dict[str, Any] = {}
         for key in SHEET_HEADERS:
             value = raw.get(key, DEFAULTS[key])
@@ -245,13 +367,21 @@ class PantryBotRuntime:
                 value = DEFAULTS[key]
             item[key] = value
 
+        if _is_bad_name(item.get("Item Name")) and fallback_name:
+            cleaned = fallback_name.strip()
+            if not _is_bad_name(cleaned):
+                item["Item Name"] = cleaned.title() if cleaned.islower() else cleaned
+
+        if _is_bad_name(item.get("Item Name")):
+            raise ValueError("Item Name is missing or unknown.")
+
         try:
             item["Count"] = max(0, int(item["Count"]))
         except (TypeError, ValueError):
             item["Count"] = DEFAULTS["Count"]
 
         item["Category"] = _coerce_choice(
-            item["Category"], CATEGORIES, DEFAULTS["Category"]
+            item["Category"], CATEGORIES, _guess_category(str(item["Item Name"]))
         )
         item["Storage Location"] = _coerce_choice(
             item["Storage Location"],
@@ -339,6 +469,7 @@ class PantryBotRuntime:
 
         prompt_bits = [
             "Extract the pantry item details from the provided input.",
+            "Item Name must be a concrete product/food name — never Unknown.",
         ]
         if text and text.strip():
             prompt_bits.append(f"User text/caption:\n{text.strip()}")
@@ -359,6 +490,9 @@ class PantryBotRuntime:
                 response_mime_type="application/json",
                 response_json_schema=ITEM_RESPONSE_SCHEMA,
                 temperature=0.2,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
+                ),
             ),
         )
 
@@ -380,68 +514,33 @@ class PantryBotRuntime:
         if not isinstance(parsed, dict):
             raise RuntimeError("Gemini JSON was not an object.")
 
-        return self._normalize_item(parsed)
+        return self._normalize_item(parsed, fallback_name=text)
 
-    async def gemini_search_matches(
-        self,
-        query: str,
-        inventory: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        assert self.genai_client is not None
-
-        if not inventory:
-            return []
-
-        compact = [
-            {
-                "row_index": entry["row_index"],
-                "Item Name": entry.get("Item Name", ""),
-                "Category": entry.get("Category", ""),
-                "Storage Location": entry.get("Storage Location", ""),
-                "Notes": entry.get("Notes", ""),
-            }
-            for entry in inventory
-        ]
-
-        prompt = (
-            f"Search query: {query}\n\n"
-            f"Inventory JSON:\n{json.dumps(compact, ensure_ascii=False)}"
-        )
-
-        response = await self.genai_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SEARCH_SYSTEM_INSTRUCTION,
-                response_mime_type="application/json",
-                temperature=0.1,
-            ),
-        )
-
-        raw_text = (response.text or "").strip()
-        if not raw_text:
-            return []
-
+    async def resolve_item_from_text(self, text: str) -> dict[str, Any]:
+        """Prefer Gemini enrichment; always fall back to local parsing."""
+        local_item = item_from_text(text)
         try:
-            parsed = json.loads(raw_text)
-        except json.JSONDecodeError:
-            logger.warning("Search JSON parse failed: %s", raw_text[:300])
-            return []
-
-        match_rows = {
-            int(m["row_index"])
-            for m in parsed.get("matches", [])
-            if isinstance(m, dict) and "row_index" in m
-        }
-
-        return [entry for entry in inventory if entry["row_index"] in match_rows]
+            gemini_item = await self.gemini_extract_item(text=text)
+            # Keep Gemini details, but never allow a worse/blank name.
+            if _is_bad_name(gemini_item.get("Item Name")):
+                gemini_item["Item Name"] = local_item["Item Name"]
+            if not gemini_item.get("Count"):
+                gemini_item["Count"] = local_item["Count"]
+            return gemini_item
+        except Exception:
+            logger.warning(
+                "Gemini extract failed; using local parse for %r",
+                text,
+                exc_info=True,
+            )
+            return local_item
 
     @staticmethod
     def format_item_markdown(
         item: dict[str, Any], *, row_index: int | None = None
     ) -> str:
         lines = [
-            f"*📦 {_escape_md(item.get('Item Name', 'Unknown'))}*",
+            f"*📦 {_escape_md(item.get('Item Name', 'Item'))}*",
             f"• Category: `{_escape_md(item.get('Category', 'N/A'))}`",
             f"• Storage: `{_escape_md(item.get('Storage Location', 'N/A'))}`",
             f"• Count: `{_escape_md(item.get('Count', 0))}`",
@@ -487,7 +586,10 @@ class PantryBotRuntime:
 
         application.add_handler(CommandHandler("start", self.start_command))
         application.add_handler(CommandHandler("help", self.help_command))
+        application.add_handler(CommandHandler("add", self.add_command))
         application.add_handler(CommandHandler("search", self.search_command))
+        application.add_handler(CommandHandler("edit", self.edit_command))
+        application.add_handler(CommandHandler("list", self.list_command))
         application.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
         application.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text)
@@ -507,6 +609,7 @@ class PantryBotRuntime:
         self.application = self.build_application(config["token"])
 
         await self.application.initialize()
+        await self.application.bot.set_my_commands(BOT_COMMANDS)
         await self.application.start()
         assert self.application.updater is not None
         await self.application.updater.start_polling(
@@ -539,11 +642,13 @@ class PantryBotRuntime:
         await update.message.reply_text(
             (
                 "*Pantry Inventory Bot*\n\n"
-                "Send a *photo* of a product (optional caption) or a *text* "
-                "description to add an item.\n\n"
+                "Add items with `/add pasta`, a photo, or plain text.\n\n"
                 "Commands:\n"
-                "• `/search <query>` – fuzzy find items and manage counts\n"
-                "• `/start` – show this help\n"
+                "• `/add <item>` – add an item (e.g. `/add pasta 2`)\n"
+                "• `/search <query>` – find items\n"
+                "• `/edit <query>` – change count or delete\n"
+                "• `/list` – show recent items\n"
+                "• `/help` – show this help\n"
             ),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -552,6 +657,49 @@ class PantryBotRuntime:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         await self.start_command(update, context)
+
+    async def _save_text_item(
+        self, update: Update, text: str, *, status_prefix: str
+    ) -> None:
+        assert update.message
+        status = await update.message.reply_text(status_prefix)
+
+        try:
+            item = await self.resolve_item_from_text(text)
+            await asyncio.to_thread(self.sheet_append_item, item)
+        except Exception:
+            logger.exception("Text item creation failed for %r", text)
+            await status.edit_text(
+                "❌ Could not save that item. Try `/add pasta` or "
+                "`/add pasta 2`."
+            )
+            return
+
+        await status.edit_text(
+            "✅ *Item added to pantry*\n\n" + self.format_item_markdown(item),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    async def add_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not update.message:
+            return
+        text = " ".join(context.args).strip() if context.args else ""
+        if not text:
+            await update.message.reply_text(
+                "Usage: `/add <item>`\nExamples:\n"
+                "• `/add pasta`\n"
+                "• `/add pasta 2`\n"
+                "• `/add 2x olive oil`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        await self._save_text_item(
+            update,
+            text,
+            status_prefix="➕ Adding item…",
+        )
 
     async def _download_best_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -575,15 +723,26 @@ class PantryBotRuntime:
 
         try:
             image_bytes = await self._download_best_photo(update, context)
-            item = await self.gemini_extract_item(
-                text=caption or None, image_bytes=image_bytes
-            )
+            try:
+                item = await self.gemini_extract_item(
+                    text=caption or None, image_bytes=image_bytes
+                )
+            except Exception:
+                if caption.strip():
+                    logger.warning(
+                        "Gemini photo extract failed; falling back to caption",
+                        exc_info=True,
+                    )
+                    item = item_from_text(caption)
+                else:
+                    raise
             await asyncio.to_thread(self.sheet_append_item, item)
         except Exception:
             logger.exception("Photo item creation failed")
             await status.edit_text(
                 "❌ Could not extract or save the item from that photo. "
-                "Please try again with a clearer image or add a caption."
+                "Please try again with a clearer image or add a caption "
+                "(or use `/add <item>`)."
             )
             return
 
@@ -597,41 +756,20 @@ class PantryBotRuntime:
     ) -> None:
         if not update.message or not update.message.text:
             return
-
-        status = await update.message.reply_text(
-            "🔍 Extracting item details with Gemini…"
+        await self._save_text_item(
+            update,
+            update.message.text,
+            status_prefix="➕ Adding item…",
         )
 
-        try:
-            item = await self.gemini_extract_item(text=update.message.text)
-            await asyncio.to_thread(self.sheet_append_item, item)
-        except Exception:
-            logger.exception("Text item creation failed")
-            await status.edit_text(
-                "❌ Could not extract or save the item from that message. "
-                "Try a clearer description (name, size, count, location)."
-            )
-            return
-
-        await status.edit_text(
-            "✅ *Item added to pantry*\n\n" + self.format_item_markdown(item),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-
-    async def search_command(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    async def _reply_search_results(
+        self,
+        update: Update,
+        query: str,
+        *,
+        heading: str,
     ) -> None:
-        if not update.message:
-            return
-
-        query = " ".join(context.args).strip() if context.args else ""
-        if not query:
-            await update.message.reply_text(
-                "Usage: `/search <item_name_or_category>`",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return
-
+        assert update.message
         status = await update.message.reply_text(
             f"🔎 Searching pantry for *{_escape_md(query)}*…",
             parse_mode=ParseMode.MARKDOWN,
@@ -639,23 +777,23 @@ class PantryBotRuntime:
 
         try:
             inventory = await asyncio.to_thread(self.sheet_get_inventory)
-            matches = await self.gemini_search_matches(query, inventory)
+            matches = local_search(query, inventory)
         except Exception:
             logger.exception("Search failed for query=%r", query)
-            await status.edit_text(
-                "❌ Search failed while reading the sheet or calling Gemini."
-            )
+            await status.edit_text("❌ Search failed while reading the sheet.")
             return
 
         if not matches:
             await status.edit_text(
-                f"No matches found for *{_escape_md(query)}*.",
+                f"No matches found for *{_escape_md(query)}*.\n"
+                f"Try `/add {_escape_md(query)}` to create it.",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
 
         await status.edit_text(
-            f"Found *{len(matches)}* match(es) for *{_escape_md(query)}*:",
+            f"{heading}\nFound *{len(matches)}* match(es) for "
+            f"*{_escape_md(query)}*:",
             parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -666,6 +804,79 @@ class PantryBotRuntime:
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=self.action_keyboard(row_index),
             )
+
+    async def search_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not update.message:
+            return
+
+        query = " ".join(context.args).strip() if context.args else ""
+        if not query:
+            await update.message.reply_text(
+                "Usage: `/search <item_name_or_category>`\n"
+                "Example: `/search pasta`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        await self._reply_search_results(
+            update, query, heading="Search results"
+        )
+
+    async def edit_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not update.message:
+            return
+
+        query = " ".join(context.args).strip() if context.args else ""
+        if not query:
+            await update.message.reply_text(
+                "Usage: `/edit <item>`\n"
+                "Example: `/edit pasta`\n"
+                "Then use ➕ / ➖ / ❌ on the result.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        await self._reply_search_results(
+            update,
+            query,
+            heading="Edit mode — use the buttons to change count or delete",
+        )
+
+    async def list_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not update.message:
+            return
+
+        status = await update.message.reply_text("📋 Loading recent items…")
+        try:
+            inventory = await asyncio.to_thread(self.sheet_get_inventory)
+        except Exception:
+            logger.exception("List failed")
+            await status.edit_text("❌ Could not read the pantry sheet.")
+            return
+
+        if not inventory:
+            await status.edit_text("Pantry is empty. Try `/add pasta`.")
+            return
+
+        recent = inventory[-15:]
+        lines = [f"*Recent items* ({len(inventory)} total):\n"]
+        for entry in reversed(recent):
+            name = _escape_md(entry.get("Item Name", "Item"))
+            count = _escape_md(entry.get("Count", "?"))
+            category = _escape_md(entry.get("Category", ""))
+            lines.append(f"• *{name}* — `{count}` _{category}_")
+
+        await status.edit_text(
+            "\n".join(lines)
+            + "\n\nUse `/search <name>` or `/edit <name>` to manage one.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
     async def callback_handler(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -720,7 +931,7 @@ class PantryBotRuntime:
             try:
                 await query.edit_message_text(
                     "❌ That action failed. The row may no longer exist — "
-                    "try `/search` again."
+                    "try `/search` or `/edit` again."
                 )
             except Exception:
                 logger.debug(
