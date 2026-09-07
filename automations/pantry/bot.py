@@ -19,6 +19,7 @@ from google import genai
 from google.genai import types
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -663,9 +664,24 @@ class PantryBotRuntime:
         )
 
     def build_application(self, token: str) -> Application:
+        request = HTTPXRequest(
+            connect_timeout=30.0,
+            read_timeout=30.0,
+            write_timeout=30.0,
+            pool_timeout=30.0,
+        )
         application = (
             Application.builder()
             .token(token)
+            .request(request)
+            .get_updates_request(
+                HTTPXRequest(
+                    connect_timeout=30.0,
+                    read_timeout=30.0,
+                    write_timeout=30.0,
+                    pool_timeout=30.0,
+                )
+            )
             .concurrent_updates(True)
             .build()
         )
