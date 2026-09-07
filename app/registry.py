@@ -24,6 +24,13 @@ def _load_automations() -> list[Automation]:
     except Exception:
         logger.exception("Failed to register Pantry automation")
 
+    try:
+        from automations.medicine import MedicineAutomation
+
+        items.append(MedicineAutomation())
+    except Exception:
+        logger.exception("Failed to register Medicine automation")
+
     return items
 
 

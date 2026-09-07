@@ -497,6 +497,18 @@ def require_config() -> dict[str, str]:
         credentials_path = "credentials.json"
         creds_key = "PANTRY_CREDENTIALS_PATH"
 
+    worksheet_name, _ = _env_first("PANTRY_WORKSHEET", default="")
+    worksheet_gid_raw, _ = _env_first("PANTRY_WORKSHEET_GID", default="")
+    worksheet_gid = ""
+    if worksheet_gid_raw:
+        try:
+            worksheet_gid = str(int(worksheet_gid_raw))
+        except ValueError as exc:
+            raise RuntimeError(
+                "PANTRY_WORKSHEET_GID must be an integer "
+                f"(got {worksheet_gid_raw!r})"
+            ) from exc
+
     missing = [
         key
         for key, value in (
@@ -523,6 +535,8 @@ def require_config() -> dict[str, str]:
         "gemini_key": gemini_key,
         "spreadsheet_id": spreadsheet_id,
         "credentials_path": credentials_path,
+        "worksheet_name": worksheet_name,
+        "worksheet_gid": worksheet_gid,
     }
 
 
@@ -539,10 +553,21 @@ class PantryBotRuntime:
         self.worksheet: gspread.Worksheet | None = None
         self.application: Application | None = None
 
-    def init_sheet(self, credentials_path: str, spreadsheet_id: str) -> gspread.Worksheet:
+    def init_sheet(
+        self,
+        credentials_path: str,
+        spreadsheet_id: str,
+        worksheet_name: str = "",
+        worksheet_gid: str = "",
+    ) -> gspread.Worksheet:
         client = gspread.service_account(filename=credentials_path)
         spreadsheet = client.open_by_key(spreadsheet_id)
-        sheet = spreadsheet.sheet1
+        if worksheet_gid:
+            sheet = spreadsheet.get_worksheet_by_id(int(worksheet_gid))
+        elif worksheet_name:
+            sheet = spreadsheet.worksheet(worksheet_name)
+        else:
+            sheet = spreadsheet.sheet1
         logger.info(
             "Connected to spreadsheet %s (worksheet: %s)",
             spreadsheet_id,
@@ -842,6 +867,8 @@ class PantryBotRuntime:
             self.init_sheet,
             config["credentials_path"],
             config["spreadsheet_id"],
+            config.get("worksheet_name", ""),
+            config.get("worksheet_gid", ""),
         )
         self.application = self.build_application(config["token"])
 
