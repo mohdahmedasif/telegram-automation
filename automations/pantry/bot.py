@@ -79,7 +79,7 @@ REORDER_STATUSES = [
     "Reorder",
 ]
 
-# Naming style: Product Name (Company) — e.g. "Chickpeas (Freshona)"
+# Naming style: English Product Name (Company) — e.g. "Chickpeas (Freshona)"
 ITEM_NAME_STYLE = "Product Name (Company)"
 
 DEFAULTS = {
@@ -87,10 +87,24 @@ DEFAULTS = {
     "Category": "Canned Goods",
     "Storage Location": "Kitchen Cabinet",
     "Count": 1,
-    "Unit Size": "N/A",
+    "Unit Size": "",
     "Reorder Status": "OK",
-    "Expiration Date": "N/A",
-    "Days until Expiration": "N/A",
+    "Expiration Date": "",
+    "Days until Expiration": "",
+}
+
+# Optional sheet fields use blank cells — never write N/A placeholders.
+BLANK_PLACEHOLDERS = {
+    "",
+    "n/a",
+    "na",
+    "n.a.",
+    "none",
+    "null",
+    "unknown",
+    "skip",
+    "-",
+    "no",
 }
 
 BAD_ITEM_NAMES = {
@@ -180,7 +194,7 @@ FIELD_PROMPTS = {
     "Count": "How many do you have?",
     "Category": "Which category?",
     "Storage Location": "Where is it stored?",
-    "Unit Size": "What unit size? (e.g. `500g`, `1L`, or `N/A`)",
+    "Unit Size": "What unit size? (e.g. `500g`, `1L`) — or tap Skip.",
     "Expiration Date": (
         "What is the expiration date?\n"
         "Send `YYYY-MM-DD` (e.g. `2028-07-07`), `July 2028`, or tap Skip."
@@ -200,9 +214,12 @@ EXTRACTION_SYSTEM_INSTRUCTION = (
     "Expiration Date, Days until Expiration.\n"
     "Item Name MUST follow this naming style: "
     f"{ITEM_NAME_STYLE}. "
+    "Always write the product name in English (translate from the user's "
+    "language or label text if needed). Keep brand/company names as written "
+    "on the packaging. "
     "Examples: 'Ground Cinnamon (K-Classic)', 'Chickpeas (Freshona)', "
     "'Sella Basmati Rice (Mahmood Rice)'. "
-    "If the brand/company is unknown, use the product name only "
+    "If the brand/company is unknown, use the English product name only "
     "(no empty parentheses).\n"
     "Item Name MUST be a real product/food name from the user text or image. "
     "Never use Unknown, N/A, or placeholders for Item Name.\n"
@@ -212,8 +229,11 @@ EXTRACTION_SYSTEM_INSTRUCTION = (
     + "\n"
     f"Storage Location MUST be exactly one of: {', '.join(STORAGE_LOCATIONS)}. "
     "Default to 'Kitchen Cabinet' unless the user/image clearly specifies another.\n"
-    "Convert dates into YYYY-MM-DD format if provided, otherwise 'N/A'. "
-    "Days until Expiration: leave as 'N/A' in extraction; the app computes it.\n"
+    "Unit Size: use the size if known (e.g. 500g, 1L); otherwise leave blank "
+    "(never write N/A).\n"
+    "Convert dates into YYYY-MM-DD format if provided, otherwise leave blank "
+    "(never write N/A).\n"
+    "Days until Expiration: leave blank in extraction; the app computes it.\n"
     "Reorder Status: use 'OK' unless count is 0, then 'Reorder'."
 )
 
@@ -283,9 +303,17 @@ _MONTH_NAMES = {
 }
 
 
+def blank_if_placeholder(value: Any) -> str:
+    """Turn N/A-style placeholders into an empty string for the sheet."""
+    text = str(value or "").strip()
+    if text.casefold() in BLANK_PLACEHOLDERS:
+        return ""
+    return text
+
+
 def normalize_expiration(value: Any) -> str | None:
     """
-    Normalize an expiration value to YYYY-MM-DD or N/A.
+    Normalize an expiration value to YYYY-MM-DD, or blank if skipped.
 
     Returns None when the input cannot be parsed (caller should re-prompt).
     """
@@ -294,18 +322,8 @@ def normalize_expiration(value: Any) -> str | None:
     text = str(value or "").strip()
     if not text:
         return None
-    if text.casefold() in {
-        "n/a",
-        "na",
-        "none",
-        "null",
-        "unknown",
-        "skip",
-        "-",
-        "no",
-        "n.a.",
-    }:
-        return "N/A"
+    if text.casefold() in BLANK_PLACEHOLDERS:
+        return ""
 
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"[./]", "-", text)
@@ -384,16 +402,16 @@ def extract_expiration_from_text(text: str) -> str | None:
         if not match:
             continue
         normalized = normalize_expiration(match.group(1))
-        if normalized and normalized != "N/A":
+        if normalized:
             return normalized
     return None
 
 
 def is_real_expiration(value: Any) -> bool:
-    text = str(value or "").strip()
-    if not text or text.upper() in {"N/A", "NA", "NONE", "NULL", "UNKNOWN", ""}:
+    text = blank_if_placeholder(value)
+    if not text:
         return False
-    return normalize_expiration(text) not in (None, "N/A")
+    return bool(normalize_expiration(text))
 
 
 def reorder_status_for_count(count: int) -> str:
@@ -406,12 +424,12 @@ def days_until_expiration(expiration: Any) -> str | int:
     from datetime import date
 
     normalized = normalize_expiration(expiration)
-    if normalized is None or normalized == "N/A":
-        return "N/A"
+    if not normalized:
+        return ""
     try:
         exp = date.fromisoformat(normalized)
     except ValueError:
-        return "N/A"
+        return ""
     return (exp - date.today()).days
 
 
@@ -427,8 +445,8 @@ def format_product_name(name: Any, company: Any | None = None) -> str:
         return text
     if re.search(r"\([^)]+\)\s*$", text):
         return text
-    brand = re.sub(r"\s+", " ", str(company or "").strip())
-    if brand and brand.upper() not in {"N/A", "NA", "UNKNOWN", "NONE"}:
+    brand = blank_if_placeholder(company)
+    if brand:
         return f"{text} ({brand})"
     return text
 
@@ -450,21 +468,6 @@ def is_non_item_message(text: str) -> bool:
     if not re.search(r"[a-z0-9]", cleaned):
         return True
     return False
-
-
-def _names_related(user_name: str, other_name: str) -> bool:
-    """Reject Gemini inventing a different product than what the user typed."""
-    user = str(user_name or "").casefold().strip()
-    other = str(other_name or "").casefold().strip()
-    if not user or not other:
-        return False
-    if user in other or other in user:
-        return True
-    user_tokens = {t for t in re.split(r"[^\w]+", user) if len(t) > 2}
-    other_tokens = {t for t in re.split(r"[^\w]+", other) if len(t) > 2}
-    if user_tokens and user_tokens & other_tokens:
-        return True
-    return SequenceMatcher(None, user, other).ratio() >= 0.55
 
 
 def _guess_category(name: str) -> str:
@@ -793,12 +796,20 @@ class PantryBotRuntime:
             DEFAULTS["Storage Location"],
         )
 
-        expiration = str(item["Expiration Date"]).strip()
-        normalized_exp = normalize_expiration(expiration)
-        item["Expiration Date"] = (
-            normalized_exp if normalized_exp is not None else DEFAULTS["Expiration Date"]
-        )
-        item["Days until Expiration"] = days_until_expiration(item["Expiration Date"])
+        expiration = blank_if_placeholder(item["Expiration Date"])
+        if not expiration:
+            item["Expiration Date"] = ""
+            item["Days until Expiration"] = ""
+        else:
+            normalized_exp = normalize_expiration(expiration)
+            item["Expiration Date"] = (
+                normalized_exp if normalized_exp is not None else ""
+            )
+            item["Days until Expiration"] = days_until_expiration(
+                item["Expiration Date"]
+            )
+
+        item["Unit Size"] = blank_if_placeholder(item.get("Unit Size"))
         item["Reorder Status"] = reorder_status_for_count(item["Count"])
 
         return item
@@ -870,9 +881,10 @@ class PantryBotRuntime:
             "Extract the pantry item details from the provided input.",
             f"Item Name style: {ITEM_NAME_STYLE} "
             "(example: 'Chickpeas (Freshona)').",
+            "Translate the product name to English; keep brand names as written.",
             "Choose Category from this exact list only:",
             ", ".join(CATEGORIES),
-            "Item Name must be a concrete product/food name — never Unknown.",
+            "Item Name must be a concrete English product/food name — never Unknown.",
         ]
         if text and text.strip():
             prompt_bits.append(f"User text/caption:\n{text.strip()}")
@@ -932,14 +944,14 @@ class PantryBotRuntime:
         try:
             gemini_item = await self.gemini_extract_item(text=text)
             gemini_name = str(gemini_item.get("Item Name") or "")
-            if _is_bad_name(gemini_name) or not _names_related(
-                str(local_item["Item Name"]), gemini_name
-            ):
+            # Prefer Gemini's English name (including translations). Only fall
+            # back to the local parse when Gemini returns a bad placeholder.
+            if _is_bad_name(gemini_name):
                 gemini_item["Item Name"] = local_item["Item Name"]
                 gemini_item["Count"] = local_item["Count"]
                 gemini_item["Category"] = local_item["Category"]
 
-            # Explicit user hints always win.
+            # Explicit user hints always win (except Item Name — keep English).
             for key in (
                 "Count",
                 "Storage Location",
@@ -969,17 +981,20 @@ class PantryBotRuntime:
         item: dict[str, Any], *, row_index: int | None = None
     ) -> str:
         days = item.get("Days until Expiration")
-        if days in (None, ""):
+        if days is None or (
+            isinstance(days, str)
+            and days.strip().casefold() in BLANK_PLACEHOLDERS
+        ):
             days = days_until_expiration(item.get("Expiration Date"))
         lines = [
             f"*📦 {_escape_md(item.get('Item Name', 'Item'))}*",
-            f"• Category: `{_escape_md(item.get('Category', 'N/A'))}`",
-            f"• Storage: `{_escape_md(item.get('Storage Location', 'N/A'))}`",
+            f"• Category: `{_escape_md(item.get('Category') or '')}`",
+            f"• Storage: `{_escape_md(item.get('Storage Location') or '')}`",
             f"• Count: `{_escape_md(item.get('Count', 0))}`",
-            f"• Unit Size: `{_escape_md(item.get('Unit Size', 'N/A'))}`",
+            f"• Unit Size: `{_escape_md(blank_if_placeholder(item.get('Unit Size')))}`",
             f"• Reorder: `{_escape_md(item.get('Reorder Status', 'OK'))}`",
-            f"• Expires: `{_escape_md(item.get('Expiration Date', 'N/A'))}`",
-            f"• Days left: `{_escape_md(days)}`",
+            f"• Expires: `{_escape_md(blank_if_placeholder(item.get('Expiration Date')))}`",
+            f"• Days left: `{_escape_md('' if days is None else days)}`",
         ]
         if row_index is not None:
             lines.append(f"• Sheet row: `{row_index}`")
@@ -1177,7 +1192,7 @@ class PantryBotRuntime:
                 [
                     [
                         InlineKeyboardButton(
-                            "Skip (N/A)", callback_data="cf:u:N/A"
+                            "Skip", callback_data="cf:u:"
                         )
                     ],
                     [InlineKeyboardButton("Cancel", callback_data="cf:cancel")],
@@ -1200,7 +1215,7 @@ class PantryBotRuntime:
             rows.append(
                 [
                     InlineKeyboardButton(
-                        "Skip (N/A)", callback_data="cf:exp:na"
+                        "Skip", callback_data="cf:exp:skip"
                     )
                 ]
             )
@@ -1372,7 +1387,7 @@ class PantryBotRuntime:
                 item.get("Storage Location") or DEFAULTS["Storage Location"],
             )
         elif field == "Unit Size":
-            item["Unit Size"] = value
+            item["Unit Size"] = blank_if_placeholder(value)
         elif field == "Expiration Date":
             if value.casefold() in {"keep", "suggested"}:
                 normalized = normalize_expiration(item.get("Expiration Date"))
@@ -1381,7 +1396,7 @@ class PantryBotRuntime:
             if normalized is None:
                 return (
                     "Could not read that date. Try `2028-07-07`, `July 2028`, "
-                    "or `N/A`."
+                    "or tap Skip."
                 )
             item["Expiration Date"] = normalized
             item["Days until Expiration"] = days_until_expiration(normalized)
@@ -1482,10 +1497,14 @@ class PantryBotRuntime:
                     _cap_item, cap_provided = parse_add_text(caption)
                     provided |= cap_provided
                     for key in cap_provided:
+                        # Keep Gemini's English Item Name; caption may be
+                        # in another language.
+                        if key == "Item Name":
+                            continue
                         if key in _cap_item:
                             item[key] = _cap_item[key]
                 unit = str(item.get("Unit Size") or "").strip()
-                if unit and unit.upper() not in {"N/A", "NA", "UNKNOWN", ""}:
+                if unit and blank_if_placeholder(unit):
                     provided.add("Unit Size")
                 if is_real_expiration(item.get("Expiration Date")):
                     item["Expiration Date"] = (
@@ -1754,7 +1773,7 @@ class PantryBotRuntime:
                     return
 
                 if data.startswith("cf:u:"):
-                    value = data[5:] or "N/A"
+                    value = data[5:]
                     error = await self._apply_field_answer(
                         context, "Unit Size", value
                     )
@@ -1771,7 +1790,7 @@ class PantryBotRuntime:
                     if action == "keep":
                         value = "keep"
                     else:
-                        value = "N/A"
+                        value = "skip"
                     error = await self._apply_field_answer(
                         context, "Expiration Date", value
                     )
