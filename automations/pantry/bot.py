@@ -39,20 +39,23 @@ logger = logging.getLogger("automations.pantry")
 GEMINI_MODEL = resolve_gemini_model()
 
 COL_COUNT = 4
+COL_REORDER = 6
+COL_EXPIRATION = 7
+COL_DAYS_UNTIL = 8
 
 SHEET_HEADERS = [
     "Item Name",
     "Category",
     "Storage Location",
     "Count",
-    "Container Type",
     "Unit Size",
     "Reorder Status",
     "Expiration Date",
-    "Notes",
+    "Days until Expiration",
 ]
 
 # Allowed values from Google Sheets data-validation dropdowns.
+# Passed to Gemini so it must pick one of these (never invent a category).
 CATEGORIES = [
     "Grains & Rice",
     "Oils & Condiments",
@@ -71,24 +74,23 @@ STORAGE_LOCATIONS = [
     "Washroom Cabinet",
 ]
 
-CONTAINER_TYPES = [
-    "Bottles",
-    "Tins",
-    "Boxes",
-    "Packages",
-    "Jars",
+REORDER_STATUSES = [
+    "OK",
+    "Reorder",
 ]
+
+# Naming style: Product Name (Company) — e.g. "Chickpeas (Freshona)"
+ITEM_NAME_STYLE = "Product Name (Company)"
 
 DEFAULTS = {
     "Item Name": "",
     "Category": "Canned Goods",
     "Storage Location": "Kitchen Cabinet",
     "Count": 1,
-    "Container Type": "Packages",
     "Unit Size": "N/A",
     "Reorder Status": "OK",
     "Expiration Date": "N/A",
-    "Notes": "",
+    "Days until Expiration": "N/A",
 }
 
 BAD_ITEM_NAMES = {
@@ -164,7 +166,6 @@ CLARIFY_FIELDS = [
     "Count",
     "Category",
     "Storage Location",
-    "Container Type",
     "Unit Size",
     "Expiration Date",
 ]
@@ -172,7 +173,6 @@ CLARIFY_FIELDS = [
 FIELD_CHOICES: dict[str, list[str]] = {
     "Category": CATEGORIES,
     "Storage Location": STORAGE_LOCATIONS,
-    "Container Type": CONTAINER_TYPES,
     "Count": ["1", "2", "3", "4", "5", "6", "8", "10"],
 }
 
@@ -180,7 +180,6 @@ FIELD_PROMPTS = {
     "Count": "How many do you have?",
     "Category": "Which category?",
     "Storage Location": "Where is it stored?",
-    "Container Type": "What container type?",
     "Unit Size": "What unit size? (e.g. `500g`, `1L`, or `N/A`)",
     "Expiration Date": (
         "What is the expiration date?\n"
@@ -192,22 +191,30 @@ FIELD_CALLBACK_KEYS = {
     "Count": "cnt",
     "Category": "cat",
     "Storage Location": "loc",
-    "Container Type": "ctr",
 }
 CALLBACK_KEY_TO_FIELD = {v: k for k, v in FIELD_CALLBACK_KEYS.items()}
 
 EXTRACTION_SYSTEM_INSTRUCTION = (
     "Extract pantry item details into a JSON object with keys: Item Name, "
-    "Category, Storage Location, Count, Container Type, Unit Size, "
-    "Reorder Status, Expiration Date, Notes.\n"
+    "Category, Storage Location, Count, Unit Size, Reorder Status, "
+    "Expiration Date, Days until Expiration.\n"
+    "Item Name MUST follow this naming style: "
+    f"{ITEM_NAME_STYLE}. "
+    "Examples: 'Ground Cinnamon (K-Classic)', 'Chickpeas (Freshona)', "
+    "'Sella Basmati Rice (Mahmood Rice)'. "
+    "If the brand/company is unknown, use the product name only "
+    "(no empty parentheses).\n"
     "Item Name MUST be a real product/food name from the user text or image. "
     "Never use Unknown, N/A, or placeholders for Item Name.\n"
-    f"Category MUST be exactly one of: {', '.join(CATEGORIES)}.\n"
+    "Category MUST be exactly one of these values "
+    "(choose the best fit; never invent a new category):\n"
+    + "\n".join(f"- {c}" for c in CATEGORIES)
+    + "\n"
     f"Storage Location MUST be exactly one of: {', '.join(STORAGE_LOCATIONS)}. "
     "Default to 'Kitchen Cabinet' unless the user/image clearly specifies another.\n"
-    f"Container Type MUST be exactly one of: {', '.join(CONTAINER_TYPES)}.\n"
     "Convert dates into YYYY-MM-DD format if provided, otherwise 'N/A'. "
-    "Do not invent dropdown values outside these lists."
+    "Days until Expiration: leave as 'N/A' in extraction; the app computes it.\n"
+    "Reorder Status: use 'OK' unless count is 0, then 'Reorder'."
 )
 
 ITEM_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -217,22 +224,19 @@ ITEM_RESPONSE_SCHEMA: dict[str, Any] = {
         "Category": {"type": "string", "enum": CATEGORIES},
         "Storage Location": {"type": "string", "enum": STORAGE_LOCATIONS},
         "Count": {"type": "integer"},
-        "Container Type": {"type": "string", "enum": CONTAINER_TYPES},
         "Unit Size": {"type": "string"},
-        "Reorder Status": {"type": "string"},
+        "Reorder Status": {"type": "string", "enum": REORDER_STATUSES},
         "Expiration Date": {"type": "string"},
-        "Notes": {"type": "string"},
+        "Days until Expiration": {"type": "string"},
     },
     "required": [
         "Item Name",
         "Category",
         "Storage Location",
         "Count",
-        "Container Type",
         "Unit Size",
         "Reorder Status",
         "Expiration Date",
-        "Notes",
     ],
 }
 
@@ -392,6 +396,43 @@ def is_real_expiration(value: Any) -> bool:
     return normalize_expiration(text) not in (None, "N/A")
 
 
+def reorder_status_for_count(count: int) -> str:
+    """Count 0 → Reorder; otherwise OK."""
+    return "Reorder" if int(count) <= 0 else "OK"
+
+
+def days_until_expiration(expiration: Any) -> str | int:
+    """Calendar days from today until expiration (negative if already expired)."""
+    from datetime import date
+
+    normalized = normalize_expiration(expiration)
+    if normalized is None or normalized == "N/A":
+        return "N/A"
+    try:
+        exp = date.fromisoformat(normalized)
+    except ValueError:
+        return "N/A"
+    return (exp - date.today()).days
+
+
+def format_product_name(name: Any, company: Any | None = None) -> str:
+    """
+    Enforce naming style: Product Name (Company).
+
+    If name already ends with (Something), leave it. Otherwise attach company
+    when provided.
+    """
+    text = re.sub(r"\s+", " ", str(name or "").strip())
+    if not text:
+        return text
+    if re.search(r"\([^)]+\)\s*$", text):
+        return text
+    brand = re.sub(r"\s+", " ", str(company or "").strip())
+    if brand and brand.upper() not in {"N/A", "NA", "UNKNOWN", "NONE"}:
+        return f"{text} ({brand})"
+    return text
+
+
 def _is_bad_name(value: Any) -> bool:
     return str(value or "").strip().casefold() in BAD_ITEM_NAMES
 
@@ -467,7 +508,6 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
     working = raw
 
     storage = None
-    container = None
     unit_size = None
 
     for loc in STORAGE_LOCATIONS:
@@ -477,21 +517,6 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
                 rf"\b{re.escape(loc)}\b", " ", working, flags=re.IGNORECASE
             )
             provided.add("Storage Location")
-            break
-
-    for cont in CONTAINER_TYPES:
-        singular = cont[:-1] if cont.endswith("s") else cont
-        if re.search(rf"\b{re.escape(cont)}\b", working, flags=re.IGNORECASE) or re.search(
-            rf"\b{re.escape(singular)}\b", working, flags=re.IGNORECASE
-        ):
-            container = cont
-            working = re.sub(
-                rf"\b{re.escape(cont)}\b|\b{re.escape(singular)}\b",
-                " ",
-                working,
-                flags=re.IGNORECASE,
-            )
-            provided.add("Container Type")
             break
 
     unit_match = re.search(
@@ -532,20 +557,22 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
         raise ValueError("Could not determine an item name from that text.")
 
     item = dict(DEFAULTS)
-    item["Item Name"] = name.title() if name.islower() else name
+    item["Item Name"] = format_product_name(
+        name.title() if name.islower() else name
+    )
     item["Count"] = count
     item["Category"] = _guess_category(name)
+    item["Reorder Status"] = reorder_status_for_count(count)
     provided.add("Item Name")
     if count_explicit:
         provided.add("Count")
     if storage:
         item["Storage Location"] = storage
-    if container:
-        item["Container Type"] = container
     if unit_size:
         item["Unit Size"] = unit_size
     if expiration:
         item["Expiration Date"] = expiration
+        item["Days until Expiration"] = days_until_expiration(expiration)
 
     lowered = raw.casefold()
     for category, words in [
@@ -586,7 +613,7 @@ def local_search(
         name = str(entry.get("Item Name") or "")
         name_cf = name.casefold()
         category = str(entry.get("Category") or "").casefold()
-        notes = str(entry.get("Notes") or "").casefold()
+        location = str(entry.get("Storage Location") or "").casefold()
 
         if q == name_cf:
             score = 300.0
@@ -597,11 +624,10 @@ def local_search(
             if name_token_hits:
                 score = 150.0 + name_token_hits * 25.0
                 score += SequenceMatcher(None, q, name_cf).ratio() * 40.0
-            elif q in notes or any(t in notes for t in tokens):
-                score = 90.0
             elif q in category or any(t in category for t in tokens):
-                # Category-only matches rank lower than name hits.
                 score = 70.0
+            elif q in location or any(t in location for t in tokens):
+                score = 50.0
             else:
                 ratio = SequenceMatcher(None, q, name_cf).ratio()
                 if ratio < 0.58:
@@ -750,11 +776,14 @@ class PantryBotRuntime:
         if _is_bad_name(item.get("Item Name")):
             raise ValueError("Item Name is missing or unknown.")
 
+        item["Item Name"] = format_product_name(item["Item Name"])
+
         try:
             item["Count"] = max(0, int(item["Count"]))
         except (TypeError, ValueError):
             item["Count"] = DEFAULTS["Count"]
 
+        # Gemini (or local guess) must resolve to an allowed category.
         item["Category"] = _coerce_choice(
             item["Category"], CATEGORIES, _guess_category(str(item["Item Name"]))
         )
@@ -763,34 +792,21 @@ class PantryBotRuntime:
             STORAGE_LOCATIONS,
             DEFAULTS["Storage Location"],
         )
-        item["Container Type"] = _coerce_choice(
-            item["Container Type"], CONTAINER_TYPES, DEFAULTS["Container Type"]
-        )
 
         expiration = str(item["Expiration Date"]).strip()
         normalized_exp = normalize_expiration(expiration)
         item["Expiration Date"] = (
             normalized_exp if normalized_exp is not None else DEFAULTS["Expiration Date"]
         )
-
-        if not str(item["Reorder Status"]).strip():
-            item["Reorder Status"] = DEFAULTS["Reorder Status"]
+        item["Days until Expiration"] = days_until_expiration(item["Expiration Date"])
+        item["Reorder Status"] = reorder_status_for_count(item["Count"])
 
         return item
 
     def sheet_append_item(self, item: dict[str, Any]) -> list[Any]:
         assert self.worksheet is not None
-        row = [
-            item["Item Name"],
-            item["Category"],
-            item["Storage Location"],
-            item["Count"],
-            item["Container Type"],
-            item["Unit Size"],
-            item["Reorder Status"],
-            item["Expiration Date"],
-            item["Notes"],
-        ]
+        item = self._normalize_item(item)
+        row = [item[header] for header in SHEET_HEADERS]
         self.worksheet.append_row(row, value_input_option="USER_ENTERED")
         return row
 
@@ -801,6 +817,11 @@ class PantryBotRuntime:
         for index, record in enumerate(records):
             entry = dict(record)
             entry["row_index"] = index + 2
+            # Keep Days until Expiration fresh when reading for display/search.
+            if "Expiration Date" in entry:
+                entry["Days until Expiration"] = days_until_expiration(
+                    entry.get("Expiration Date")
+                )
             inventory.append(entry)
         return inventory
 
@@ -815,7 +836,9 @@ class PantryBotRuntime:
     def sheet_set_count(self, row_index: int, value: int) -> int:
         assert self.worksheet is not None
         new_val = max(0, int(value))
+        reorder = reorder_status_for_count(new_val)
         self.worksheet.update_cell(row_index, COL_COUNT, new_val)
+        self.worksheet.update_cell(row_index, COL_REORDER, reorder)
         return new_val
 
     def sheet_delete_row(self, row_index: int) -> None:
@@ -845,6 +868,10 @@ class PantryBotRuntime:
 
         prompt_bits = [
             "Extract the pantry item details from the provided input.",
+            f"Item Name style: {ITEM_NAME_STYLE} "
+            "(example: 'Chickpeas (Freshona)').",
+            "Choose Category from this exact list only:",
+            ", ".join(CATEGORIES),
             "Item Name must be a concrete product/food name — never Unknown.",
         ]
         if text and text.strip():
@@ -916,8 +943,8 @@ class PantryBotRuntime:
             for key in (
                 "Count",
                 "Storage Location",
-                "Container Type",
                 "Unit Size",
+                "Expiration Date",
             ):
                 if key in provided:
                     gemini_item[key] = local_item[key]
@@ -926,12 +953,9 @@ class PantryBotRuntime:
             if not gemini_item.get("Count"):
                 gemini_item["Count"] = local_item["Count"]
 
-            notes = str(gemini_item.get("Notes") or "")
-            if re.search(
-                r"no item|not provided|unknown|n/?a", notes, flags=re.IGNORECASE
-            ):
-                gemini_item["Notes"] = ""
-            return gemini_item, provided | {"Item Name"}
+            return self._normalize_item(gemini_item, fallback_name=text), provided | {
+                "Item Name"
+            }
         except Exception:
             logger.warning(
                 "Gemini extract failed; using local parse for %r",
@@ -944,19 +968,19 @@ class PantryBotRuntime:
     def format_item_markdown(
         item: dict[str, Any], *, row_index: int | None = None
     ) -> str:
+        days = item.get("Days until Expiration")
+        if days in (None, ""):
+            days = days_until_expiration(item.get("Expiration Date"))
         lines = [
             f"*📦 {_escape_md(item.get('Item Name', 'Item'))}*",
             f"• Category: `{_escape_md(item.get('Category', 'N/A'))}`",
             f"• Storage: `{_escape_md(item.get('Storage Location', 'N/A'))}`",
             f"• Count: `{_escape_md(item.get('Count', 0))}`",
-            f"• Container: `{_escape_md(item.get('Container Type', 'N/A'))}`",
             f"• Unit Size: `{_escape_md(item.get('Unit Size', 'N/A'))}`",
             f"• Reorder: `{_escape_md(item.get('Reorder Status', 'OK'))}`",
             f"• Expires: `{_escape_md(item.get('Expiration Date', 'N/A'))}`",
+            f"• Days left: `{_escape_md(days)}`",
         ]
-        notes = item.get("Notes")
-        if notes:
-            lines.append(f"• Notes: _{_escape_md(notes)}_")
         if row_index is not None:
             lines.append(f"• Sheet row: `{row_index}`")
         return "\n".join(lines)
@@ -1336,6 +1360,7 @@ class PantryBotRuntime:
             if not match:
                 return "Send a number for count (e.g. `2`)."
             item["Count"] = max(0, int(match.group(0)))
+            item["Reorder Status"] = reorder_status_for_count(item["Count"])
         elif field == "Category":
             item["Category"] = _coerce_choice(
                 value, CATEGORIES, item.get("Category") or DEFAULTS["Category"]
@@ -1345,12 +1370,6 @@ class PantryBotRuntime:
                 value,
                 STORAGE_LOCATIONS,
                 item.get("Storage Location") or DEFAULTS["Storage Location"],
-            )
-        elif field == "Container Type":
-            item["Container Type"] = _coerce_choice(
-                value,
-                CONTAINER_TYPES,
-                item.get("Container Type") or DEFAULTS["Container Type"],
             )
         elif field == "Unit Size":
             item["Unit Size"] = value
@@ -1365,10 +1384,12 @@ class PantryBotRuntime:
                     "or `N/A`."
                 )
             item["Expiration Date"] = normalized
+            item["Days until Expiration"] = days_until_expiration(normalized)
         else:
             return f"Unexpected field: {field}"
 
         provided.add(field)
+        item = self._normalize_item(item)
         self._set_pending(
             context, item=item, provided=provided, awaiting=None
         )
@@ -1482,8 +1503,6 @@ class PantryBotRuntime:
                     )
                 ):
                     provided.add("Storage Location")
-                if item.get("Container Type") in CONTAINER_TYPES:
-                    provided.add("Container Type")
                 if item.get("Count") not in (None, "", 0):
                     # Count from photo alone is a guess — only trust caption count.
                     if "Count" in provided:
