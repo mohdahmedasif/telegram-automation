@@ -101,13 +101,12 @@ Never commit `.env` or `credentials.json` — they are gitignored.
 
 ## Google Sheet schemas
 
-**Pantry:** Item Name, Category, Storage Location, Count, Unit Size, Reorder Status, Expiration Date, Days until Expiration  
+**Pantry:** Item Name, Category, Storage Location, Count, Unit Size, Expiration Date  
 
 - Item names use `Product Name (Company)` (e.g. `Chickpeas (Freshona)`).  
 - Category is chosen by Gemini from the fixed dropdown list.  
 - Duplicate rows with different expiry dates are kept.  
-- When Count is `0`, Reorder Status becomes `Reorder`.  
-- Days until Expiration is computed from today’s date.
+- Optional Reorder / Days-left columns can live in the sheet via formulas; the bot does not write them.
 
 **Medicine:** Item Name, Formula, Storage Location, Type, Count, Container Type, Count per Units, Unit Size, Reorder Status, Expiration Date, Notes  
 

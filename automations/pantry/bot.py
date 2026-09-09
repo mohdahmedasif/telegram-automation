@@ -39,9 +39,6 @@ logger = logging.getLogger("automations.pantry")
 GEMINI_MODEL = resolve_gemini_model()
 
 COL_COUNT = 4
-COL_REORDER = 6
-COL_EXPIRATION = 7
-COL_DAYS_UNTIL = 8
 
 SHEET_HEADERS = [
     "Item Name",
@@ -49,9 +46,7 @@ SHEET_HEADERS = [
     "Storage Location",
     "Count",
     "Unit Size",
-    "Reorder Status",
     "Expiration Date",
-    "Days until Expiration",
 ]
 
 # Allowed values from Google Sheets data-validation dropdowns.
@@ -74,11 +69,6 @@ STORAGE_LOCATIONS = [
     "Washroom Cabinet",
 ]
 
-REORDER_STATUSES = [
-    "OK",
-    "Reorder",
-]
-
 # Naming style: English Product Name (Company) — e.g. "Chickpeas (Freshona)"
 ITEM_NAME_STYLE = "Product Name (Company)"
 
@@ -88,9 +78,7 @@ DEFAULTS = {
     "Storage Location": "Kitchen Cabinet",
     "Count": 1,
     "Unit Size": "",
-    "Reorder Status": "OK",
     "Expiration Date": "",
-    "Days until Expiration": "",
 }
 
 # Optional sheet fields use blank cells — never write N/A placeholders.
@@ -210,8 +198,7 @@ CALLBACK_KEY_TO_FIELD = {v: k for k, v in FIELD_CALLBACK_KEYS.items()}
 
 EXTRACTION_SYSTEM_INSTRUCTION = (
     "Extract pantry item details into a JSON object with keys: Item Name, "
-    "Category, Storage Location, Count, Unit Size, Reorder Status, "
-    "Expiration Date, Days until Expiration.\n"
+    "Category, Storage Location, Count, Unit Size, Expiration Date.\n"
     "Item Name MUST follow this naming style: "
     f"{ITEM_NAME_STYLE}. "
     "Always write the product name in English (translate from the user's "
@@ -232,9 +219,7 @@ EXTRACTION_SYSTEM_INSTRUCTION = (
     "Unit Size: use the size if known (e.g. 500g, 1L); otherwise leave blank "
     "(never write N/A).\n"
     "Convert dates into YYYY-MM-DD format if provided, otherwise leave blank "
-    "(never write N/A).\n"
-    "Days until Expiration: leave blank in extraction; the app computes it.\n"
-    "Reorder Status: use 'OK' unless count is 0, then 'Reorder'."
+    "(never write N/A)."
 )
 
 ITEM_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -245,9 +230,7 @@ ITEM_RESPONSE_SCHEMA: dict[str, Any] = {
         "Storage Location": {"type": "string", "enum": STORAGE_LOCATIONS},
         "Count": {"type": "integer"},
         "Unit Size": {"type": "string"},
-        "Reorder Status": {"type": "string", "enum": REORDER_STATUSES},
         "Expiration Date": {"type": "string"},
-        "Days until Expiration": {"type": "string"},
     },
     "required": [
         "Item Name",
@@ -255,7 +238,6 @@ ITEM_RESPONSE_SCHEMA: dict[str, Any] = {
         "Storage Location",
         "Count",
         "Unit Size",
-        "Reorder Status",
         "Expiration Date",
     ],
 }
@@ -414,25 +396,6 @@ def is_real_expiration(value: Any) -> bool:
     return bool(normalize_expiration(text))
 
 
-def reorder_status_for_count(count: int) -> str:
-    """Count 0 → Reorder; otherwise OK."""
-    return "Reorder" if int(count) <= 0 else "OK"
-
-
-def days_until_expiration(expiration: Any) -> str | int:
-    """Calendar days from today until expiration (negative if already expired)."""
-    from datetime import date
-
-    normalized = normalize_expiration(expiration)
-    if not normalized:
-        return ""
-    try:
-        exp = date.fromisoformat(normalized)
-    except ValueError:
-        return ""
-    return (exp - date.today()).days
-
-
 def format_product_name(name: Any, company: Any | None = None) -> str:
     """
     Enforce naming style: Product Name (Company).
@@ -565,7 +528,6 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
     )
     item["Count"] = count
     item["Category"] = _guess_category(name)
-    item["Reorder Status"] = reorder_status_for_count(count)
     provided.add("Item Name")
     if count_explicit:
         provided.add("Count")
@@ -575,7 +537,6 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
         item["Unit Size"] = unit_size
     if expiration:
         item["Expiration Date"] = expiration
-        item["Days until Expiration"] = days_until_expiration(expiration)
 
     lowered = raw.casefold()
     for category, words in [
@@ -799,18 +760,13 @@ class PantryBotRuntime:
         expiration = blank_if_placeholder(item["Expiration Date"])
         if not expiration:
             item["Expiration Date"] = ""
-            item["Days until Expiration"] = ""
         else:
             normalized_exp = normalize_expiration(expiration)
             item["Expiration Date"] = (
                 normalized_exp if normalized_exp is not None else ""
             )
-            item["Days until Expiration"] = days_until_expiration(
-                item["Expiration Date"]
-            )
 
         item["Unit Size"] = blank_if_placeholder(item.get("Unit Size"))
-        item["Reorder Status"] = reorder_status_for_count(item["Count"])
 
         return item
 
@@ -828,11 +784,6 @@ class PantryBotRuntime:
         for index, record in enumerate(records):
             entry = dict(record)
             entry["row_index"] = index + 2
-            # Keep Days until Expiration fresh when reading for display/search.
-            if "Expiration Date" in entry:
-                entry["Days until Expiration"] = days_until_expiration(
-                    entry.get("Expiration Date")
-                )
             inventory.append(entry)
         return inventory
 
@@ -847,9 +798,7 @@ class PantryBotRuntime:
     def sheet_set_count(self, row_index: int, value: int) -> int:
         assert self.worksheet is not None
         new_val = max(0, int(value))
-        reorder = reorder_status_for_count(new_val)
         self.worksheet.update_cell(row_index, COL_COUNT, new_val)
-        self.worksheet.update_cell(row_index, COL_REORDER, reorder)
         return new_val
 
     def sheet_delete_row(self, row_index: int) -> None:
@@ -980,21 +929,13 @@ class PantryBotRuntime:
     def format_item_markdown(
         item: dict[str, Any], *, row_index: int | None = None
     ) -> str:
-        days = item.get("Days until Expiration")
-        if days is None or (
-            isinstance(days, str)
-            and days.strip().casefold() in BLANK_PLACEHOLDERS
-        ):
-            days = days_until_expiration(item.get("Expiration Date"))
         lines = [
             f"*📦 {_escape_md(item.get('Item Name', 'Item'))}*",
             f"• Category: `{_escape_md(item.get('Category') or '')}`",
             f"• Storage: `{_escape_md(item.get('Storage Location') or '')}`",
             f"• Count: `{_escape_md(item.get('Count', 0))}`",
             f"• Unit Size: `{_escape_md(blank_if_placeholder(item.get('Unit Size')))}`",
-            f"• Reorder: `{_escape_md(item.get('Reorder Status', 'OK'))}`",
             f"• Expires: `{_escape_md(blank_if_placeholder(item.get('Expiration Date')))}`",
-            f"• Days left: `{_escape_md('' if days is None else days)}`",
         ]
         if row_index is not None:
             lines.append(f"• Sheet row: `{row_index}`")
@@ -1375,7 +1316,6 @@ class PantryBotRuntime:
             if not match:
                 return "Send a number for count (e.g. `2`)."
             item["Count"] = max(0, int(match.group(0)))
-            item["Reorder Status"] = reorder_status_for_count(item["Count"])
         elif field == "Category":
             item["Category"] = _coerce_choice(
                 value, CATEGORIES, item.get("Category") or DEFAULTS["Category"]
@@ -1399,7 +1339,6 @@ class PantryBotRuntime:
                     "or tap Skip."
                 )
             item["Expiration Date"] = normalized
-            item["Days until Expiration"] = days_until_expiration(normalized)
         else:
             return f"Unexpected field: {field}"
 
