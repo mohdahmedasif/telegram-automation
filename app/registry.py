@@ -18,18 +18,11 @@ def _load_automations() -> list[Automation]:
     items: list[Automation] = []
 
     try:
-        from automations.pantry import PantryAutomation
+        from automations.inventory import InventoryAutomation
 
-        items.append(PantryAutomation())
+        items.append(InventoryAutomation())
     except Exception:
-        logger.exception("Failed to register Pantry automation")
-
-    try:
-        from automations.medicine import MedicineAutomation
-
-        items.append(MedicineAutomation())
-    except Exception:
-        logger.exception("Failed to register Medicine automation")
+        logger.exception("Failed to register Inventory automation")
 
     return items
 

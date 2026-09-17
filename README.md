@@ -8,18 +8,17 @@ Run a local web UI to start/stop automations. Each automation is its own Telegra
 
 | Automation | What it does |
 |------------|----------------|
-| **Pantry Inventory** | Add grocery items from text or photos, store them in Sheets, fuzzy `/search`, inline count ±1 / delete |
-| **Medicine Inventory** | Track medicines/supplements; `/search` matches by **brand, formula, or symptoms** (e.g. `headache` → paracetamol) via Gemini |
+| **Household Inventory** | One bot for pantry groceries and medicine/supplements in a single Google Sheet. Add items from text or photos — Gemini figures out the category; `/search` matches by name, brand, category, or (for medicine) symptoms (e.g. `headache` → paracetamol). Adding is conversational: describe the item, confirm a one-message recap, correct anything by just typing — no step-by-step wizard. |
 
 ## Architecture
 
 ```text
-main.py                 → starts the Relay web UI
-app/registry.py         → registers automations
-app/web/                → FastAPI UI (list + Start/Stop)
-automations/base.py     → shared Automation contract
-automations/pantry/     → pantry Telegram bot
-automations/medicine/   → medicine Telegram bot
+main.py                    → starts the Relay web UI
+app/registry.py            → registers automations
+app/web/                   → FastAPI UI (list + Start/Stop)
+automations/base.py        → shared Automation contract
+automations/inventory_sheet.py → shared sheet schema + gspread I/O
+automations/inventory/     → household inventory Telegram bot
 ```
 
 Add a new bot by implementing `Automation` under `automations/` and registering it in `app/registry.py`.
@@ -60,55 +59,43 @@ Open **http://127.0.0.1:8765**, then **Start** an automation.
 
 ## Configuration
 
-Copy `.env.example` → `.env`. Each automation has its **own** bot token and spreadsheet ID. Optional `*_WORKSHEET_GID` selects a tab inside that spreadsheet (the `gid=` value from the Sheets URL).
+Copy `.env.example` → `.env`. Optional `INVENTORY_WORKSHEET_GID` selects a tab inside the spreadsheet (the `gid=` value from the Sheets URL).
 
 ```env
 GEMINI_API_KEY=...
 CREDENTIALS_PATH=credentials.json
 
-PANTRY_TELEGRAM_BOT_TOKEN=...
-PANTRY_SPREADSHEET_ID=...
-# PANTRY_WORKSHEET_GID=...
-
-MEDICINE_TELEGRAM_BOT_TOKEN=...
-MEDICINE_SPREADSHEET_ID=...
-# MEDICINE_WORKSHEET_GID=...
+INVENTORY_TELEGRAM_BOT_TOKEN=...
+INVENTORY_SPREADSHEET_ID=...
+# INVENTORY_WORKSHEET_GID=...
 ```
 
 Never commit `.env` or `credentials.json` — they are gitignored.
 
 ## Telegram commands
 
-### Pantry
-
 | Command | Description |
 |---------|-------------|
-| `/add <item>` | Add an item (photos work too) |
-| `/search <query>` | Fuzzy find items |
+| `/add <item>` | Add an item — text or photo. Also works without the command: just describe what you got and the bot starts the same conversation. |
+| `/search <name\|brand\|category\|symptom>` | e.g. `/search pasta`, `/search headache`, `/search nexpro` |
 | `/edit <query>` | Adjust count or delete |
 | `/list` | Recent items |
 | `/cancel` | Cancel an in-progress add |
 
-### Medicine
+Adding is a short conversation, not a fixed wizard: describe the item (or send a photo), the bot fills in everything it can and asks only if the name itself is unclear, then shows a one-message recap. Reply with any correction in plain English (e.g. "actually 3 packs, put it in the basement") or tap **Save**/**Cancel**.
 
-| Command | Description |
-|---------|-------------|
-| `/add <name>` | Add a medicine/supplement |
-| `/search <name\|formula\|symptom>` | e.g. `/search headache` or `/search pantoprazole` |
-| `/edit <query>` | Adjust count or delete |
-| `/list` | Recent items |
-| `/cancel` | Cancel an in-progress add |
+## Google Sheet schema
 
-## Google Sheet schemas
+One shared tab covers both groceries and medicine/supplements via the `category` column:
 
-**Pantry:** Item Name, Category, Storage Location, Count, Unit Size, Expiration Date  
+`item_id, name, brand, category, location, package_type, package_count, units_per_package, size_value, size_unit, expiry_date, notes, last_updated`
 
-- Item names use `Product Name (Company)` (e.g. `Chickpeas (Freshona)`).  
-- Category is chosen by Gemini from the fixed dropdown list.  
-- Duplicate rows with different expiry dates are kept.  
-- Optional Reorder / Days-left columns can live in the sheet via formulas; the bot does not write them.
-
-**Medicine:** Item Name, Formula, Storage Location, Type, Count, Container Type, Count per Units, Unit Size, Reorder Status, Expiration Date, Notes  
+- `category` dropdown: `Grains & Rice, Canned Goods, Pasta & Noodles, Seasonings & Spices, Beverages, Medicine, Supplement`
+- `location` dropdown: `Sofa Storage, Kitchen Cabinet, Basement, Washroom Cabinet`
+- `package_type` dropdown: `Tablet Strip, Bottle, Flask, Box, Sachet, Jar, Can, Pack, Loose`
+- `item_id` and `last_updated` are bot-assigned (sequential id, today's date) — everything else comes from Gemini extraction or your corrections.
+- For medicine, symptom/purpose text lives in `notes`; `/search` matches on `name`, `brand`, `category`, and `notes`, so a query like `headache` or `pantoprazole` still finds the right row.
+- Optional formula columns (days-until-expiry, reorder status) can live in the sheet; the bot never writes them.
 
 Row 1 = headers; data starts at row 2.
 
