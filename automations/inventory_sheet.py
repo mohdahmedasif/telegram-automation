@@ -1,11 +1,8 @@
 """
 Shared Google Sheets schema + helpers for the unified household inventory.
 
-Pantry and Medicine are separate Telegram bots (separate tokens, separate
-Gemini prompts/personalities) but read/write the **same** spreadsheet tab,
-using one shared row schema. This module owns everything that schema touches
-so it isn't duplicated across `automations/pantry/bot.py` and
-`automations/medicine/bot.py`.
+One Telegram bot reads/writes a single spreadsheet tab using this row schema.
+This module owns everything that schema touches so bot handlers stay thin.
 """
 
 from __future__ import annotations
@@ -52,8 +49,7 @@ COL_EXPIRY_DATE = 11
 COL_NOTES = 12
 COL_LAST_UPDATED = 13
 
-# Full sheet-level dropdown lists (data validation). Each bot restricts
-# Gemini's `category`/`package_type` enum to the subset relevant to it.
+# Sheet-level dropdown lists (data validation). Gemini's enums use the same sets.
 CATEGORIES = [
     "Grains & Rice",
     "Canned Goods",
@@ -260,8 +256,10 @@ def extract_expiration_from_text(text: str) -> str | None:
     patterns = [
         r"\bexp(?:iry|ires|iration)?\.?\s*[:=]?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
         r"\bexp(?:iry|ires|iration)?\.?\s*[:=]?\s*(\d{4}-\d{2}-\d{2})",
+        r"\bexp(?:iry|ires|iration)?\.?\s*[:=]?\s*(\d{4}-\d{2})\b",
         r"\bexp(?:iry|ires|iration)?\.?\s*[:=]?\s*([A-Za-z]+\s+\d{4})",
         r"\b(\d{4}-\d{2}-\d{2})\b",
+        r"\b(\d{4}-\d{2})\b",
         r"\b([A-Za-z]+\s+\d{1,2},?\s+\d{4})\b",
         r"\b([A-Za-z]+\s+\d{4})\b",
     ]

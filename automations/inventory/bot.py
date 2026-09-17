@@ -182,16 +182,33 @@ SEARCH_SYSTEM_INSTRUCTION = (
 def _guess_category(name: str) -> str:
     lowered = (name or "").casefold()
     keywords = [
+        ("Medicine", (
+            "medicine", "tablet", "capsule", "syrup", "paracetamol", "ibuprofen",
+            "pantoprazol", "pantoprazole", "nexpro", "aspirin", "antibiotic",
+            "ointment", "drops",
+        )),
+        ("Supplement", (
+            "vitamin", "supplement", "omega", "probiotic", "magnesium", "zinc",
+            "multivitamin", "collagen",
+        )),
         ("Pasta & Noodles", ("pasta", "noodle", "spaghetti", "macaroni", "penne")),
         ("Grains & Rice", ("rice", "lentil", "bean", "grain", "quinoa", "flour", "oat")),
-        ("Canned Goods", ("can", "canned", "olive", "jalape", "tuna", "corn")),
+        ("Canned Goods", ("canned", "olive", "jalape", "tuna", "corn")),
         ("Seasonings & Spices", ("spice", "cinnamon", "garlic", "pepper", "salt", "ginger", "honey")),
         ("Beverages", ("juice", "tea", "coffee", "water", "soda", "drink")),
     ]
     for category, words in keywords:
-        if any(word in lowered for word in words):
+        if any(re.search(rf"\b{re.escape(word)}", lowered) for word in words):
             return category
+    if re.search(r"\bcan\b", lowered):
+        return "Canned Goods"
     return DEFAULTS["category"]
+
+
+def _default_location_for_category(category: str) -> str:
+    if category in {"Medicine", "Supplement"}:
+        return "Washroom Cabinet"
+    return str(DEFAULTS["location"])
 
 
 def _is_bad_name(value: Any) -> bool:
@@ -245,11 +262,24 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
     if expiration:
         item["expiry_date"] = expiration
         provided.add("expiry_date")
+        # Strip expiry phrases/dates so they don't pollute the name or count.
+        expiry_strip_patterns = [
+            r"\bexp(?:iry|ires|iration)?\.?\s*[:=]?\s*[A-Za-z]+\s+\d{1,2},?\s+\d{4}\b",
+            r"\bexp(?:iry|ires|iration)?\.?\s*[:=]?\s*\d{4}-\d{2}(?:-\d{2})?\b",
+            r"\bexp(?:iry|ires|iration)?\.?\s*[:=]?\s*[A-Za-z]+\s+\d{4}\b",
+            r"\b\d{4}-\d{2}(?:-\d{2})?\b",
+            r"\b[A-Za-z]+\s+\d{1,2},?\s+\d{4}\b",
+            r"\b[A-Za-z]+\s+\d{4}\b",
+        ]
+        for pattern in expiry_strip_patterns:
+            working = re.sub(pattern, " ", working, flags=re.IGNORECASE)
 
     count_explicit = False
     count = 1
     explicit_count = re.search(
-        r"\b(\d+)\s*(?:packs?|strips?|boxes?|cans?|bottles?|jars?)\b", working, flags=re.IGNORECASE
+        r"\b(\d+)\s*(?:packs?|strips?|boxes?|cans?|bottles?|jars?)\b",
+        working,
+        flags=re.IGNORECASE,
     )
     if explicit_count:
         count = max(1, int(explicit_count.group(1)))
@@ -258,11 +288,11 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
 
     working = re.sub(r"\s+", " ", working).strip(" -,:;")
     name = working
+    # Only treat numbers as counts when tied to x/× — bare trailing years must
+    # not become package_count (e.g. "rice 2025").
     patterns = [
         r"^(?P<count>\d+)\s*[x×]\s*(?P<name>.+)$",
         r"^(?P<name>.+?)\s*[x×]\s*(?P<count>\d+)$",
-        r"^(?P<name>.+?)\s+(?P<count>\d+)$",
-        r"^(?P<count>\d+)\s+(?P<name>.+)$",
     ]
     for pattern in patterns:
         match = re.fullmatch(pattern, working, flags=re.IGNORECASE)
@@ -277,6 +307,8 @@ def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
     if name and not _is_bad_name(name):
         item["name"] = name.title() if name.islower() else name
         item["category"] = _guess_category(name)
+        if "location" not in provided:
+            item["location"] = _default_location_for_category(item["category"])
         provided.add("name")
     if count_explicit:
         item["package_count"] = count
@@ -340,10 +372,18 @@ def _env_first(*names: str, default: str = "") -> tuple[str, str]:
 
 
 def require_config() -> dict[str, str]:
-    """Load inventory bot settings (`INVENTORY_*` preferred, unprefixed as fallback)."""
-    token, token_key = _env_first("INVENTORY_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
+    """Load inventory bot settings (`INVENTORY_*` preferred; legacy pantry as fallback)."""
+    token, token_key = _env_first(
+        "INVENTORY_TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_BOT_TOKEN",
+        "PANTRY_TELEGRAM_BOT_TOKEN",
+    )
     gemini_key, gemini_key_name = _env_first("INVENTORY_GEMINI_API_KEY", "GEMINI_API_KEY")
-    spreadsheet_id, sheet_key = _env_first("INVENTORY_SPREADSHEET_ID", "SPREADSHEET_ID")
+    spreadsheet_id, sheet_key = _env_first(
+        "INVENTORY_SPREADSHEET_ID",
+        "SPREADSHEET_ID",
+        "PANTRY_SPREADSHEET_ID",
+    )
     credentials_path, creds_key = _env_first(
         "INVENTORY_CREDENTIALS_PATH", "CREDENTIALS_PATH", default="credentials.json"
     )
@@ -351,6 +391,8 @@ def require_config() -> dict[str, str]:
         credentials_path = "credentials.json"
         creds_key = "INVENTORY_CREDENTIALS_PATH"
 
+    # Do not fall back to PANTRY_/MEDICINE_ worksheet gids — those tabs use the
+    # pre-merge column schema and would silently corrupt writes.
     worksheet_name, _ = _env_first("INVENTORY_WORKSHEET", default="")
     worksheet_gid_raw, _ = _env_first("INVENTORY_WORKSHEET_GID", default="")
     worksheet_gid = ""
@@ -536,9 +578,16 @@ class InventoryBotRuntime:
     def apply_local_correction(self, item: dict[str, Any], text: str) -> dict[str, Any]:
         """Best-effort correction without Gemini: count/location/expiry hints only."""
         updated = dict(item)
-        count_match = re.search(r"\b(\d+)\s*(?:packs?|strips?|boxes?|cans?|bottles?|jars?)?\b", text)
-        if count_match and re.search(r"\d", text):
-            updated["package_count"] = max(0, int(count_match.group(1)))
+        # Require an explicit quantity cue — never treat years/strengths as counts.
+        count_match = re.search(
+            r"(?:\b(?:make\s+it|count|qty|quantity)\s*)?(\d+)\s*(?:packs?|strips?|boxes?|cans?|bottles?|jars?)\b"
+            r"|\b(?:make\s+it|count|qty|quantity)\s+(\d+)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if count_match:
+            raw_count = count_match.group(1) or count_match.group(2)
+            updated["package_count"] = max(0, int(raw_count))
         for loc in STORAGE_LOCATIONS:
             if loc.casefold() in text.casefold():
                 updated["location"] = loc
@@ -562,7 +611,10 @@ class InventoryBotRuntime:
             return self._normalize_item(local_item), "name" in provided
 
         merged = dict(gemini_item)
-        for key in provided:
+        # Prefer local hints for structured fields, but keep Gemini's name unless
+        # local is clearly better — local names often retain expiry residue.
+        override_keys = provided - {"name"}
+        for key in override_keys:
             merged[key] = local_item[key]
 
         if _is_bad_name(merged.get("name")) and not _is_bad_name(local_item.get("name")):
@@ -1024,10 +1076,10 @@ class InventoryBotRuntime:
         query = update.callback_query
         if not query or not query.data:
             return
-        await query.answer()
         data = query.data
 
         if data == "cf:cancel":
+            await query.answer()
             self._clear_pending(context)
             await query.edit_message_text("Cancelled. Nothing was saved.")
             return
@@ -1036,6 +1088,7 @@ class InventoryBotRuntime:
             if not self._get_pending(context):
                 await query.answer("Add session expired — start again.", show_alert=True)
                 return
+            await query.answer()
             try:
                 item = await self._save_pending_item(context)
             except Exception:
@@ -1046,6 +1099,8 @@ class InventoryBotRuntime:
                 "✅ *Saved*\n\n" + format_item_markdown(item), parse_mode=ParseMode.MARKDOWN
             )
             return
+
+        await query.answer()
 
         match = re.fullmatch(r"(inc|dec|del)_(\d+)", data)
         if not match:
