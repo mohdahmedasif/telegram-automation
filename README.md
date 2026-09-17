@@ -68,7 +68,10 @@ CREDENTIALS_PATH=credentials.json
 INVENTORY_TELEGRAM_BOT_TOKEN=...
 INVENTORY_SPREADSHEET_ID=...
 # INVENTORY_WORKSHEET_GID=...
+# INVENTORY_ALLOWED_USER_IDS=123456789,987654321
 ```
+
+`INVENTORY_ALLOWED_USER_IDS` restricts the bot to specific Telegram accounts (comma-separated numeric user ids — message [@userinfobot](https://t.me/userinfobot) to get yours). **Leave it unset and anyone who finds the bot can use it.**
 
 Never commit `.env` or `credentials.json` — they are gitignored.
 

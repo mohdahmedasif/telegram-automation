@@ -371,7 +371,22 @@ def _env_first(*names: str, default: str = "") -> tuple[str, str]:
     return default, names[0]
 
 
-def require_config() -> dict[str, str]:
+def _parse_user_ids(raw: str) -> set[int]:
+    ids: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid Telegram user id in INVENTORY_ALLOWED_USER_IDS: %r", part
+            )
+    return ids
+
+
+def require_config() -> dict[str, Any]:
     """Load inventory bot settings (`INVENTORY_*` preferred; legacy pantry as fallback)."""
     token, token_key = _env_first(
         "INVENTORY_TELEGRAM_BOT_TOKEN",
@@ -404,6 +419,15 @@ def require_config() -> dict[str, str]:
                 f"INVENTORY_WORKSHEET_GID must be an integer (got {worksheet_gid_raw!r})"
             ) from exc
 
+    allowed_ids_raw, _ = _env_first("INVENTORY_ALLOWED_USER_IDS", default="")
+    allowed_user_ids = _parse_user_ids(allowed_ids_raw)
+    if not allowed_user_ids:
+        logger.warning(
+            "INVENTORY_ALLOWED_USER_IDS is not set — anyone who finds this bot "
+            "can use it. Set it to your Telegram numeric user id(s), comma-"
+            "separated, to restrict access."
+        )
+
     missing = [
         key
         for key, value in (
@@ -432,6 +456,7 @@ def require_config() -> dict[str, str]:
         "credentials_path": credentials_path,
         "worksheet_name": worksheet_name,
         "worksheet_gid": worksheet_gid,
+        "allowed_user_ids": allowed_user_ids,
     }
 
 
@@ -442,6 +467,7 @@ class InventoryBotRuntime:
         self.genai_client: genai.Client | None = None
         self.sheet: InventorySheet | None = None
         self.application: Application | None = None
+        self.allowed_user_ids: set[int] = set()
 
     def _normalize_item(
         self, raw: dict[str, Any], *, fallback_name: str | None = None
@@ -686,7 +712,7 @@ class InventoryBotRuntime:
                 results.append(enriched)
         return results
 
-    def build_application(self, token: str) -> Application:
+    def build_application(self, token: str, allowed_user_ids: set[int]) -> Application:
         request = HTTPXRequest(
             connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0, pool_timeout=30.0
         )
@@ -706,18 +732,40 @@ class InventoryBotRuntime:
             .build()
         )
 
-        application.add_handler(CommandHandler("start", self.start_command))
-        application.add_handler(CommandHandler("help", self.help_command))
-        application.add_handler(CommandHandler("add", self.add_command))
-        application.add_handler(CommandHandler("cancel", self.cancel_command))
-        application.add_handler(CommandHandler("search", self.search_command))
-        application.add_handler(CommandHandler("edit", self.edit_command))
-        application.add_handler(CommandHandler("list", self.list_command))
-        application.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
+        auth = filters.User(user_id=allowed_user_ids) if allowed_user_ids else None
+
+        def guarded(base_filter: filters.BaseFilter | None = None) -> filters.BaseFilter | None:
+            if auth is None:
+                return base_filter
+            return auth if base_filter is None else base_filter & auth
+
+        application.add_handler(CommandHandler("start", self.start_command, filters=auth))
+        application.add_handler(CommandHandler("help", self.help_command, filters=auth))
+        application.add_handler(CommandHandler("add", self.add_command, filters=auth))
+        application.add_handler(CommandHandler("cancel", self.cancel_command, filters=auth))
+        application.add_handler(CommandHandler("search", self.search_command, filters=auth))
+        application.add_handler(CommandHandler("edit", self.edit_command, filters=auth))
+        application.add_handler(CommandHandler("list", self.list_command, filters=auth))
+        application.add_handler(MessageHandler(guarded(filters.PHOTO), self.handle_photo))
+        application.add_handler(
+            MessageHandler(guarded(filters.TEXT & ~filters.COMMAND), self.handle_text)
+        )
+        if auth is not None:
+            application.add_handler(MessageHandler(~auth, self._reject_unauthorized))
         application.add_handler(CallbackQueryHandler(self.callback_handler))
         application.add_error_handler(self.error_handler)
         return application
+
+    async def _reject_unauthorized(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if update.effective_message:
+            await update.effective_message.reply_text("🔒 This is a private bot.")
+
+    def _is_authorized(self, update: Update) -> bool:
+        if not self.allowed_user_ids:
+            return True
+        return bool(update.effective_user and update.effective_user.id in self.allowed_user_ids)
 
     async def start_polling(self) -> None:
         config = require_config()
@@ -730,7 +778,8 @@ class InventoryBotRuntime:
             config.get("worksheet_gid", ""),
         )
         self.sheet = InventorySheet(worksheet)
-        self.application = self.build_application(config["token"])
+        self.allowed_user_ids = config["allowed_user_ids"]
+        self.application = self.build_application(config["token"], self.allowed_user_ids)
 
         await self.application.initialize()
         await self.application.bot.set_my_commands(BOT_COMMANDS)
@@ -951,12 +1000,17 @@ class InventoryBotRuntime:
 
                 # Anything else is a free-text correction to the draft.
                 item = dict(pending["item"])
+                status = await update.message.reply_text("✏️ Updating…")
                 try:
                     updated = await self.gemini_refine_item(item, text)
                 except Exception:
                     logger.warning("Gemini refine failed; using local correction", exc_info=True)
                     updated = self.apply_local_correction(item, text)
                 self._set_pending(context, item=updated, awaiting="confirm")
+                try:
+                    await status.delete()
+                except Exception:
+                    logger.debug("Could not clear 'Updating…' status", exc_info=True)
                 await self._show_recap(update.message, context, edit=False)
                 return
 
@@ -1075,6 +1129,9 @@ class InventoryBotRuntime:
     async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         if not query or not query.data:
+            return
+        if not self._is_authorized(update):
+            await query.answer("🔒 Not authorized.", show_alert=True)
             return
         data = query.data
 
