@@ -984,16 +984,21 @@ class InventoryBotRuntime:
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.message:
             return
+        name = update.effective_user.first_name if update.effective_user else None
         await update.message.reply_text(
-            self._options_message(greeting=True), parse_mode=ParseMode.MARKDOWN
+            self._options_message(greeting=True, name=name), parse_mode=ParseMode.MARKDOWN
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.start_command(update, context)
 
     @staticmethod
-    def _options_message(*, greeting: bool) -> str:
-        intro = "👋 Hi — I'm your *Household Inventory* bot.\n\n" if greeting else ""
+    def _options_message(*, greeting: bool, name: str | None = None) -> str:
+        if greeting:
+            who = f" {escape_md(name.strip())}" if name and name.strip() else ""
+            intro = f"👋 Hi{who} — I'm your *Household Inventory* bot.\n\n"
+        else:
+            intro = ""
         return (
             f"{intro}"
             "Just tell me what you got — text or a photo works — and I'll "
@@ -1401,8 +1406,9 @@ class InventoryBotRuntime:
                 return
 
         if is_non_item_message(text):
+            name = update.effective_user.first_name if update.effective_user else None
             await update.message.reply_text(
-                self._options_message(greeting=True), parse_mode=ParseMode.MARKDOWN
+                self._options_message(greeting=True, name=name), parse_mode=ParseMode.MARKDOWN
             )
             return
 
