@@ -19,7 +19,7 @@ from typing import Any
 
 from google import genai
 from google.genai import types
-from telegram import BotCommand, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.request import HTTPXRequest
 from telegram.ext import (
@@ -373,6 +373,33 @@ def detect_change_field(text: str) -> str | None:
         for alias in aliases:
             if stripped == alias:
                 return field
+
+    # "change location" / "new location please" with no replacement value.
+    has_change_verb = bool(
+        re.search(r"\b(?:change|edit|update|fix|set|switch|new)\b", lowered)
+    )
+    if not has_change_verb:
+        return None
+    for field, aliases in CHANGE_FIELD_ALIASES:
+        for alias in aliases:
+            if not re.search(rf"\b{re.escape(alias)}\b", lowered):
+                continue
+            rest = re.sub(rf"\b{re.escape(alias)}\b", " ", lowered)
+            rest = re.sub(
+                r"\b(?:please|can|you|i|want|to|change|edit|update|fix|set|"
+                r"switch|new|the|what|about|how)\b",
+                " ",
+                rest,
+            )
+            rest = re.sub(r"[^\w\s]+", " ", rest)
+            rest = re.sub(r"\s+", " ", rest).strip()
+            if rest and any(choice.casefold() in rest for choice in all_choices):
+                return None
+            if rest and re.search(r"\d", rest):
+                return None
+            if rest:
+                return None
+            return field
     return None
 
 
@@ -1037,24 +1064,28 @@ class InventoryBotRuntime:
             return_to_recap=False,
         )
         text = (
-            "Got it — here's what I'll save. Anything to change, just tell "
-            "me (e.g. `change location` or `make it 2 bottles`), or tap Save.\n\n"
+            "Got it — here's what I'll save. Tap a field below to change it, "
+            "or type a correction (e.g. `make it 2 bottles`).\n\n"
             + format_item_markdown(item)
         )
         await self._send_prompt(message, text, edit=edit, reply_markup=confirm_keyboard())
 
     def _clarify_keyboard(
-        self, field: str, item: dict[str, Any]
+        self, field: str, item: dict[str, Any], *, back: bool = False
     ) -> InlineKeyboardMarkup | None:
         if field in {"category", "location", "package_type", "package_count"}:
-            return choice_keyboard(field)
+            return choice_keyboard(field, back=back)
         if field == "expiry_date":
             suggested = ""
             if is_real_expiration(item.get("expiry_date")):
                 suggested = normalize_expiration(item.get("expiry_date")) or ""
-            return expiry_keyboard(suggested=suggested)
+            return expiry_keyboard(suggested=suggested, back=back)
         if field in {"units_per_package", "size_value", "notes", "brand"}:
-            return skip_keyboard()
+            return skip_keyboard(back=back)
+        if back:
+            return InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Back", callback_data="cf:back")]]
+            )
         return None
 
     async def _prompt_field(
@@ -1081,7 +1112,7 @@ class InventoryBotRuntime:
             message,
             prompt,
             edit=edit,
-            reply_markup=self._clarify_keyboard(field, item),
+            reply_markup=self._clarify_keyboard(field, item, back=return_to_recap),
         )
 
     async def _prompt_next_clarification(
@@ -1525,6 +1556,25 @@ class InventoryBotRuntime:
                     pass
                 return
             await query.answer()
+
+            if data == "cf:back":
+                await self._show_recap(query.message, context, edit=True)
+                return
+
+            edit_match = re.fullmatch(r"cf:e:([a-z]+)", data)
+            if edit_match:
+                field = CALLBACK_KEY_TO_FIELD.get(edit_match.group(1))
+                if not field:
+                    await query.edit_message_text("❌ Unknown field.")
+                    return
+                await self._prompt_field(
+                    query.message,
+                    context,
+                    field,
+                    edit=True,
+                    return_to_recap=True,
+                )
+                return
 
             if data == "cf:skip":
                 field = pending.get("awaiting")
