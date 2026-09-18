@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import gspread
@@ -48,6 +48,32 @@ COL_SIZE_UNIT = 10
 COL_EXPIRY_DATE = 11
 COL_NOTES = 12
 COL_LAST_UPDATED = 13
+
+# Google Sheets serial dates count days from this epoch (same as Excel).
+_SHEETS_EPOCH = date(1899, 12, 30)
+
+
+def today_stamp() -> str:
+    """ISO date as text so USER_ENTERED does not turn it into serial 46282."""
+    return "'" + date.today().isoformat()
+
+
+def coerce_sheet_date(value: Any) -> str:
+    """Turn a Sheets date serial (e.g. 46282) or cell value into YYYY-MM-DD."""
+    if value is None or value == "":
+        return ""
+    if isinstance(value, (int, float)) and 20000 < float(value) < 80000:
+        return (_SHEETS_EPOCH + timedelta(days=int(value))).isoformat()
+    text = str(value).strip()
+    if text.startswith("'"):
+        text = text[1:]
+    try:
+        num = float(text)
+        if num.is_integer() and 20000 < num < 80000 and re.fullmatch(r"\d+", text):
+            return (_SHEETS_EPOCH + timedelta(days=int(num))).isoformat()
+    except ValueError:
+        pass
+    return text
 
 # Sheet-level dropdown lists (data validation). Gemini's enums use the same sets.
 CATEGORIES = [
@@ -468,6 +494,8 @@ class InventorySheet:
         for index, record in enumerate(records):
             entry = dict(record)
             entry["row_index"] = index + 2
+            entry["last_updated"] = coerce_sheet_date(entry.get("last_updated"))
+            entry["expiry_date"] = coerce_sheet_date(entry.get("expiry_date"))
             inventory.append(entry)
         return inventory
 
@@ -484,7 +512,7 @@ class InventorySheet:
     def append_item(self, item: dict[str, Any]) -> list[Any]:
         """`item` holds every header except `item_id`/`last_updated`, which are stamped here."""
         item_id = self.next_item_id()
-        last_updated = date.today().isoformat()
+        last_updated = today_stamp()
         row: list[Any] = [item_id]
         for header in SHEET_HEADERS[1:-1]:
             row.append(item.get(header, ""))
@@ -503,7 +531,7 @@ class InventorySheet:
         new_val = max(0, int(value))
         self.worksheet.update_cell(row_index, COL_PACKAGE_COUNT, new_val)
         self.worksheet.update_cell(
-            row_index, COL_LAST_UPDATED, date.today().isoformat()
+            row_index, COL_LAST_UPDATED, today_stamp()
         )
         return new_val
 
@@ -513,4 +541,7 @@ class InventorySheet:
     def row_summary(self, row_index: int) -> dict[str, Any]:
         values = self.worksheet.row_values(row_index)
         padded = values + [""] * (len(SHEET_HEADERS) - len(values))
-        return {header: padded[i] for i, header in enumerate(SHEET_HEADERS)}
+        entry = {header: padded[i] for i, header in enumerate(SHEET_HEADERS)}
+        entry["last_updated"] = coerce_sheet_date(entry.get("last_updated"))
+        entry["expiry_date"] = coerce_sheet_date(entry.get("expiry_date"))
+        return entry
