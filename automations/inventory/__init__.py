@@ -12,9 +12,9 @@ class InventoryAutomation(Automation):
         "One Telegram bot for pantry groceries and medicine/supplements in a "
         "single Google Sheet. Add items via free text or photo and Gemini "
         "figures out the category; /search matches by name, brand, category, "
-        "or (for medicine) symptoms. Adding is a conversation — describe the "
-        "item, confirm the recap, correct anything by just typing — not a "
-        "rigid step-by-step wizard."
+        "or (for medicine) symptoms. Adding is a conversation: Gemini fills "
+        "what it can, the bot asks only for blank or important fields, then "
+        "you confirm a recap (type 'change location' to reopen that picker)."
     )
     tags = ["telegram", "gemini", "google-sheets", "inventory", "medicine", "pantry"]
 

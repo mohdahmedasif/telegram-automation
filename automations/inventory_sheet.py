@@ -324,6 +324,22 @@ def format_item_markdown(item: dict[str, Any], *, row_index: int | None = None) 
     return "\n".join(lines)
 
 
+FIELD_CALLBACK_KEYS = {
+    "category": "cat",
+    "location": "loc",
+    "package_type": "pkg",
+    "package_count": "cnt",
+}
+CALLBACK_KEY_TO_FIELD = {v: k for k, v in FIELD_CALLBACK_KEYS.items()}
+
+FIELD_CHOICES: dict[str, list[str]] = {
+    "category": CATEGORIES,
+    "location": STORAGE_LOCATIONS,
+    "package_type": PACKAGE_TYPES,
+    "package_count": ["1", "2", "3", "4", "5", "6", "8", "10"],
+}
+
+
 def confirm_keyboard(save_label: str = "✅ Save") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -333,6 +349,52 @@ def confirm_keyboard(save_label: str = "✅ Save") -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def choice_keyboard(
+    field: str, *, extra_rows: list[list[InlineKeyboardButton]] | None = None
+) -> InlineKeyboardMarkup | None:
+    choices = FIELD_CHOICES.get(field) or []
+    key = FIELD_CALLBACK_KEYS.get(field)
+    if not choices or not key:
+        return None
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for idx, choice in enumerate(choices):
+        row.append(InlineKeyboardButton(choice, callback_data=f"cf:v:{key}:{idx}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if extra_rows:
+        rows.extend(extra_rows)
+    rows.append([InlineKeyboardButton("Cancel", callback_data="cf:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def skip_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Skip", callback_data="cf:skip")],
+            [InlineKeyboardButton("Cancel", callback_data="cf:cancel")],
+        ]
+    )
+
+
+def expiry_keyboard(*, suggested: str = "") -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if suggested:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"✅ Keep suggested: {suggested}", callback_data="cf:exp:keep"
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("Skip", callback_data="cf:exp:skip")])
+    rows.append([InlineKeyboardButton("Cancel", callback_data="cf:cancel")])
+    return InlineKeyboardMarkup(rows)
 
 
 def action_keyboard(row_index: int) -> InlineKeyboardMarkup:

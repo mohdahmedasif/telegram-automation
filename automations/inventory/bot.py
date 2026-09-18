@@ -2,9 +2,9 @@
 Household inventory Telegram bot — Google Sheets + Gemini.
 
 One bot covers pantry groceries and medicine/supplements in a single sheet.
-Adding an item is a conversation: describe it (text or photo), confirm a
-one-message recap, correct anything by just typing, tap Save. There is no
-step-by-step field wizard. Managed by `InventoryAutomation`.
+Adding an item is a conversation: Gemini fills what it can, the bot asks
+only for blank/important fields, then you confirm a recap (or type
+"change location" to reopen that picker). Managed by `InventoryAutomation`.
 """
 
 from __future__ import annotations
@@ -34,21 +34,27 @@ from telegram.ext import (
 from automations.gemini_util import generate_content_with_fallback, resolve_gemini_model
 from automations.inventory_sheet import (
     BASE_BAD_NAMES,
+    CALLBACK_KEY_TO_FIELD,
     CATEGORIES,
+    FIELD_CHOICES,
     PACKAGE_TYPES,
     SHEET_HEADERS,
     STORAGE_LOCATIONS,
     InventorySheet,
     action_keyboard,
     blank_if_placeholder,
+    choice_keyboard,
     coerce_choice,
     confirm_keyboard,
     escape_md,
+    expiry_keyboard,
     extract_expiration_from_text,
     format_item_markdown,
     is_bad_name,
+    is_real_expiration,
     normalize_expiration,
     parse_json_response,
+    skip_keyboard,
     split_size,
 )
 
@@ -94,6 +100,59 @@ BOT_COMMANDS = [
 ]
 
 PENDING_ADD_KEY = "pending_add"
+
+# Ask only when not already filled (or, for medicine extras, when blank).
+CLARIFY_FIELDS = [
+    "name",
+    "category",
+    "location",
+    "package_type",
+    "package_count",
+    "units_per_package",
+    "size_value",
+    "expiry_date",
+    "notes",
+    "brand",
+]
+
+MEDICINE_ONLY_FIELDS = {"units_per_package", "size_value", "notes"}
+
+FIELD_PROMPTS = {
+    "name": "What's this called?",
+    "category": "Which category?",
+    "location": "Where is it stored?",
+    "package_type": "What package type?",
+    "package_count": "How many packs do you have?",
+    "units_per_package": (
+        "How many units per pack? (e.g. `10` tablets) — or tap Skip."
+    ),
+    "size_value": "What size or strength? (e.g. `20 mg`, `500g`) — or tap Skip.",
+    "expiry_date": (
+        "What is the expiration date?\n"
+        "Send `YYYY-MM-DD` (e.g. `2028-07-07`), `July 2028`, or tap Skip."
+    ),
+    "notes": "What is it used for? (e.g. acid reflux) — or tap Skip.",
+    "brand": "What brand / company? — or tap Skip.",
+}
+
+# Recap phrases like "change location?" map to a field picker.
+CHANGE_FIELD_ALIASES: list[tuple[str, tuple[str, ...]]] = [
+    ("location", ("location", "loc", "storage", "stored", "store", "where")),
+    ("category", ("category", "cat", "type")),
+    ("package_type", ("package type", "package", "packaging", "container")),
+    ("package_count", ("package count", "count", "quantity", "qty", "how many", "amount")),
+    ("units_per_package", (
+        "units per package", "per pack", "per package", "tablets per", "units",
+    )),
+    ("size_value", ("size", "strength", "unit size", "dosage", "dose")),
+    ("expiry_date", (
+        "expiry date", "expiration date", "expiry", "expiration", "expires",
+        "expire", "exp", "date",
+    )),
+    ("notes", ("notes", "purpose", "use", "used for")),
+    ("brand", ("brand", "company", "manufacturer")),
+    ("name", ("name", "item name", "item", "title", "called")),
+]
 
 EXTRACTION_SYSTEM_INSTRUCTION = (
     "Extract one household inventory item — a pantry/grocery item OR a "
@@ -228,6 +287,93 @@ def is_non_item_message(text: str) -> bool:
     if not re.search(r"[a-z0-9]", cleaned):
         return True
     return False
+
+
+def _is_medicine_category(item: dict[str, Any]) -> bool:
+    return str(item.get("category") or "") in {"Medicine", "Supplement"}
+
+
+def provided_fields_from_item(item: dict[str, Any]) -> set[str]:
+    """Mark Gemini-filled / enum-valid fields so the wizard can skip them."""
+    provided: set[str] = set()
+    if not _is_bad_name(item.get("name")):
+        provided.add("name")
+    if item.get("category") in CATEGORIES:
+        provided.add("category")
+    if item.get("location") in STORAGE_LOCATIONS:
+        provided.add("location")
+    if item.get("package_type") in PACKAGE_TYPES:
+        provided.add("package_type")
+    try:
+        if int(item.get("package_count") or 0) > 0:
+            provided.add("package_count")
+    except (TypeError, ValueError):
+        pass
+    if blank_if_placeholder(item.get("units_per_package")):
+        provided.add("units_per_package")
+    if blank_if_placeholder(item.get("size_value")) or blank_if_placeholder(
+        item.get("size_unit")
+    ):
+        provided.add("size_value")
+    if is_real_expiration(item.get("expiry_date")):
+        provided.add("expiry_date")
+    if blank_if_placeholder(item.get("notes")):
+        provided.add("notes")
+    if blank_if_placeholder(item.get("brand")):
+        provided.add("brand")
+    return provided
+
+
+def missing_clarify_fields(item: dict[str, Any], provided: set[str]) -> list[str]:
+    missing: list[str] = []
+    medicine = _is_medicine_category(item)
+    for field in CLARIFY_FIELDS:
+        if field in provided:
+            continue
+        if field in MEDICINE_ONLY_FIELDS and not medicine:
+            continue
+        if field == "name" and not _is_bad_name(item.get("name")):
+            continue
+        missing.append(field)
+    return missing
+
+
+def detect_change_field(text: str) -> str | None:
+    """
+    If the user is asking to change a field without giving a new value
+    (e.g. "change location?"), return that field. Value-bearing messages
+    return None so Gemini/local refine can apply them.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    lowered = raw.casefold().strip(" ?.!,")
+    if not lowered:
+        return None
+
+    all_choices = CATEGORIES + STORAGE_LOCATIONS + PACKAGE_TYPES
+    if any(choice.casefold() == lowered for choice in all_choices):
+        return None
+
+    stripped = re.sub(
+        r"^(?:please\s+)?(?:can\s+you\s+)?(?:i\s+want\s+to\s+)?"
+        r"(?:change|edit|update|fix|set|switch)\s+(?:the\s+)?",
+        "",
+        lowered,
+        flags=re.IGNORECASE,
+    )
+    stripped = re.sub(r"^(?:what\s+about|how\s+about|about)\s+", "", stripped)
+    stripped = re.sub(r"\?+$", "", stripped).strip(" .!,")
+    stripped = re.sub(r"^(?:the\s+)?", "", stripped)
+    stripped = re.sub(r"\s+please$", "", stripped).strip()
+    if not stripped:
+        return None
+
+    for field, aliases in CHANGE_FIELD_ALIASES:
+        for alias in aliases:
+            if stripped == alias:
+                return field
+    return None
 
 
 def parse_add_text(text: str) -> tuple[dict[str, Any], set[str]]:
@@ -627,19 +773,23 @@ class InventoryBotRuntime:
             updated["expiry_date"] = expiration
         return self._normalize_item(updated)
 
-    async def resolve_item_from_text(self, text: str) -> tuple[dict[str, Any], bool]:
-        """Returns (item, has_name)."""
-        local_item, provided = parse_add_text(text)
+    async def resolve_item_from_text(self, text: str) -> tuple[dict[str, Any], set[str]]:
+        """Returns (item, provided fields)."""
+        local_item, local_provided = parse_add_text(text)
         try:
             gemini_item = await self.gemini_extract_item(text=text)
         except Exception:
             logger.exception("Gemini extract failed; using local parse")
-            return self._normalize_item(local_item), "name" in provided
+            item = self._normalize_item(local_item)
+            provided = set(local_provided)
+            if not _is_bad_name(item.get("name")):
+                provided.add("name")
+            return item, provided
 
         merged = dict(gemini_item)
         # Prefer local hints for structured fields, but keep Gemini's name unless
         # local is clearly better — local names often retain expiry residue.
-        override_keys = provided - {"name"}
+        override_keys = local_provided - {"name"}
         for key in override_keys:
             merged[key] = local_item[key]
 
@@ -647,7 +797,7 @@ class InventoryBotRuntime:
             merged["name"] = local_item["name"]
 
         merged = self._normalize_item(merged, fallback_name=text)
-        return merged, not _is_bad_name(merged.get("name"))
+        return merged, provided_fields_from_item(merged) | local_provided
 
     async def gemini_search_matches(
         self, query: str, inventory: list[dict[str, Any]]
@@ -820,7 +970,7 @@ class InventoryBotRuntime:
         return (
             f"{intro}"
             "Just tell me what you got — text or a photo works — and I'll "
-            "ask if anything important is missing.\n\n"
+            "fill what I can, then ask only what's still missing.\n\n"
             "• `/add <item>` — e.g. `/add 2 chickpeas` or `/add nexpro 20mg`\n"
             "• `/search <name|category|symptom>` — e.g. `/search pasta` or "
             "`/search headache`\n"
@@ -837,9 +987,25 @@ class InventoryBotRuntime:
         return pending if isinstance(pending, dict) else None
 
     def _set_pending(
-        self, context: ContextTypes.DEFAULT_TYPE, *, item: dict[str, Any], awaiting: str | None
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        item: dict[str, Any],
+        awaiting: str | None,
+        provided: set[str] | list[str] | None = None,
+        return_to_recap: bool | None = None,
     ) -> None:
-        context.user_data[PENDING_ADD_KEY] = {"item": item, "awaiting": awaiting}
+        existing = self._get_pending(context) or {}
+        if provided is None:
+            provided = existing.get("provided", [])
+        if return_to_recap is None:
+            return_to_recap = bool(existing.get("return_to_recap"))
+        context.user_data[PENDING_ADD_KEY] = {
+            "item": item,
+            "awaiting": awaiting,
+            "provided": list(provided),
+            "return_to_recap": bool(return_to_recap),
+        }
 
     async def _send_prompt(
         self, message, text: str, *, edit: bool, reply_markup: InlineKeyboardMarkup | None
@@ -864,24 +1030,197 @@ class InventoryBotRuntime:
         if not pending:
             return
         item = pending["item"]
-        self._set_pending(context, item=item, awaiting="confirm")
+        self._set_pending(
+            context,
+            item=item,
+            awaiting="confirm",
+            return_to_recap=False,
+        )
         text = (
             "Got it — here's what I'll save. Anything to change, just tell "
-            "me, or tap Save.\n\n" + format_item_markdown(item)
+            "me (e.g. `change location` or `make it 2 bottles`), or tap Save.\n\n"
+            + format_item_markdown(item)
         )
         await self._send_prompt(message, text, edit=edit, reply_markup=confirm_keyboard())
 
-    async def _begin_add_flow(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, *, item: dict[str, Any], has_name: bool
+    def _clarify_keyboard(
+        self, field: str, item: dict[str, Any]
+    ) -> InlineKeyboardMarkup | None:
+        if field in {"category", "location", "package_type", "package_count"}:
+            return choice_keyboard(field)
+        if field == "expiry_date":
+            suggested = ""
+            if is_real_expiration(item.get("expiry_date")):
+                suggested = normalize_expiration(item.get("expiry_date")) or ""
+            return expiry_keyboard(suggested=suggested)
+        if field in {"units_per_package", "size_value", "notes", "brand"}:
+            return skip_keyboard()
+        return None
+
+    async def _prompt_field(
+        self,
+        message,
+        context: ContextTypes.DEFAULT_TYPE,
+        field: str,
+        *,
+        edit: bool,
+        return_to_recap: bool,
     ) -> None:
-        if not has_name:
-            self._set_pending(context, item=item, awaiting="name")
-            await update.effective_message.reply_text(
-                "What's this called?", parse_mode=ParseMode.MARKDOWN
-            )
+        pending = self._get_pending(context)
+        if not pending:
             return
-        self._set_pending(context, item=item, awaiting=None)
-        await self._show_recap(update.effective_message, context, edit=False)
+        item = pending["item"]
+        self._set_pending(
+            context,
+            item=item,
+            awaiting=field,
+            return_to_recap=return_to_recap,
+        )
+        prompt = FIELD_PROMPTS.get(field, f"Provide *{field}*:")
+        await self._send_prompt(
+            message,
+            prompt,
+            edit=edit,
+            reply_markup=self._clarify_keyboard(field, item),
+        )
+
+    async def _prompt_next_clarification(
+        self, message, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
+    ) -> None:
+        pending = self._get_pending(context)
+        if not pending:
+            return
+        item = pending["item"]
+        provided = set(pending.get("provided") or [])
+        missing = missing_clarify_fields(item, provided)
+        if not missing:
+            await self._show_recap(message, context, edit=edit)
+            return
+        await self._prompt_field(
+            message, context, missing[0], edit=edit, return_to_recap=False
+        )
+
+    def _apply_field_answer(
+        self, item: dict[str, Any], field: str, value: str
+    ) -> tuple[dict[str, Any], str | None]:
+        """Apply a wizard answer. Returns (item, error)."""
+        updated = dict(item)
+        raw = (value or "").strip()
+        skip = raw.casefold() in {"skip", "na", "n/a"}
+
+        if field == "name":
+            if skip or is_non_item_message(raw) or _is_bad_name(raw):
+                return item, "I need an actual item name to continue, or `/cancel`."
+            updated["name"] = raw.title() if raw.islower() else raw
+        elif field == "category":
+            updated["category"] = coerce_choice(
+                raw, CATEGORIES, updated.get("category") or DEFAULTS["category"]
+            )
+        elif field == "location":
+            updated["location"] = coerce_choice(
+                raw, STORAGE_LOCATIONS, updated.get("location") or DEFAULTS["location"]
+            )
+        elif field == "package_type":
+            updated["package_type"] = coerce_choice(
+                raw, PACKAGE_TYPES, updated.get("package_type") or DEFAULTS["package_type"]
+            )
+        elif field == "package_count":
+            match = re.search(r"\d+", raw)
+            if not match:
+                return item, "Send a number for count (e.g. `2`)."
+            updated["package_count"] = max(0, int(match.group(0)))
+        elif field == "units_per_package":
+            cleaned = "" if skip else blank_if_placeholder(raw)
+            if cleaned:
+                digits = re.search(r"\d+", cleaned)
+                updated["units_per_package"] = digits.group(0) if digits else cleaned
+            else:
+                updated["units_per_package"] = ""
+        elif field == "size_value":
+            if skip:
+                updated["size_value"] = ""
+                updated["size_unit"] = ""
+            else:
+                value_part, unit_part = split_size(raw)
+                updated["size_value"] = value_part
+                if unit_part:
+                    updated["size_unit"] = unit_part
+        elif field == "expiry_date":
+            if skip or raw.casefold() in {"keep", "suggested"}:
+                if raw.casefold() in {"keep", "suggested"}:
+                    normalized = normalize_expiration(updated.get("expiry_date"))
+                    if normalized is None:
+                        return item, (
+                            "Could not read that date. Try `2028-07-07`, "
+                            "`July 2028`, or tap Skip."
+                        )
+                    updated["expiry_date"] = normalized
+                else:
+                    updated["expiry_date"] = ""
+            else:
+                normalized = normalize_expiration(raw)
+                if normalized is None:
+                    return item, (
+                        "Could not read that date. Try `2028-07-07`, "
+                        "`July 2028`, or tap Skip."
+                    )
+                updated["expiry_date"] = normalized
+        elif field in {"notes", "brand"}:
+            updated[field] = "" if skip else blank_if_placeholder(raw)
+        else:
+            return item, f"Unexpected field: {field}"
+
+        return self._normalize_item(updated), None
+
+    async def _finish_field_answer(
+        self,
+        message,
+        context: ContextTypes.DEFAULT_TYPE,
+        field: str,
+        value: str,
+        *,
+        edit: bool,
+    ) -> str | None:
+        pending = self._get_pending(context)
+        if not pending:
+            return "Add session expired — send a photo or /add again."
+        item, error = self._apply_field_answer(pending["item"], field, value)
+        if error:
+            return error
+        provided = set(pending.get("provided") or [])
+        provided.add(field)
+        if field == "size_value":
+            provided.add("size_unit")
+        return_to_recap = bool(pending.get("return_to_recap"))
+        self._set_pending(
+            context,
+            item=item,
+            awaiting=None,
+            provided=provided,
+            return_to_recap=False,
+        )
+        if return_to_recap:
+            await self._show_recap(message, context, edit=edit)
+        else:
+            await self._prompt_next_clarification(message, context, edit=edit)
+        return None
+
+    async def _begin_add_flow(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        item: dict[str, Any],
+        provided: set[str],
+    ) -> None:
+        self._set_pending(
+            context,
+            item=item,
+            awaiting=None,
+            provided=provided,
+            return_to_recap=False,
+        )
+        await self._prompt_next_clarification(update.effective_message, context, edit=False)
 
     async def _save_pending_item(self, context: ContextTypes.DEFAULT_TYPE) -> dict[str, Any]:
         pending = self._get_pending(context)
@@ -916,7 +1255,7 @@ class InventoryBotRuntime:
         status = await update.message.reply_text("🔍 Preparing details…")
         try:
             self._clear_pending(context)
-            item, has_name = await self.resolve_item_from_text(text)
+            item, provided = await self.resolve_item_from_text(text)
         except Exception:
             logger.exception("Add failed for text=%r", text)
             await status.edit_text(
@@ -924,7 +1263,7 @@ class InventoryBotRuntime:
             )
             return
         await status.delete()
-        await self._begin_add_flow(update, context, item=item, has_name=has_name)
+        await self._begin_add_flow(update, context, item=item, provided=provided)
 
     async def _download_best_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bytes:
         assert update.message and update.message.photo
@@ -942,13 +1281,14 @@ class InventoryBotRuntime:
         try:
             image_bytes = await self._download_best_photo(update, context)
             item = await self.gemini_extract_item(text=caption or None, image_bytes=image_bytes)
+            cap_provided: set[str] = set()
             if caption.strip():
-                _, cap_provided = parse_add_text(caption)
-                local_item, _ = parse_add_text(caption)
+                local_item, cap_provided = parse_add_text(caption)
                 for key in cap_provided:
                     if key != "name":
                         item[key] = local_item[key]
-            has_name = not _is_bad_name(item.get("name"))
+            item = self._normalize_item(item)
+            provided = provided_fields_from_item(item) | cap_provided
         except Exception:
             logger.exception("Photo extraction failed")
             await status.edit_text(
@@ -956,7 +1296,7 @@ class InventoryBotRuntime:
             )
             return
         await status.delete()
-        await self._begin_add_flow(update, context, item=item, has_name=has_name)
+        await self._begin_add_flow(update, context, item=item, provided=provided)
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.message or not update.message.text:
@@ -966,19 +1306,6 @@ class InventoryBotRuntime:
 
         if pending:
             awaiting = pending.get("awaiting")
-
-            if awaiting == "name":
-                if is_non_item_message(text) or _is_bad_name(text):
-                    await update.message.reply_text(
-                        "I need an actual item name to continue, or `/cancel`."
-                    )
-                    return
-                item = dict(pending["item"])
-                item["name"] = text.title() if text.islower() else text
-                item = self._normalize_item(item, fallback_name=text)
-                self._set_pending(context, item=item, awaiting=None)
-                await self._show_recap(update.message, context, edit=False)
-                return
 
             if awaiting == "confirm":
                 lowered = text.casefold()
@@ -998,6 +1325,17 @@ class InventoryBotRuntime:
                     await update.message.reply_text("Cancelled. Nothing was saved.")
                     return
 
+                change_field = detect_change_field(text)
+                if change_field:
+                    await self._prompt_field(
+                        update.message,
+                        context,
+                        change_field,
+                        edit=False,
+                        return_to_recap=True,
+                    )
+                    return
+
                 # Anything else is a free-text correction to the draft.
                 item = dict(pending["item"])
                 status = await update.message.reply_text("✏️ Updating…")
@@ -1006,12 +1344,29 @@ class InventoryBotRuntime:
                 except Exception:
                     logger.warning("Gemini refine failed; using local correction", exc_info=True)
                     updated = self.apply_local_correction(item, text)
-                self._set_pending(context, item=updated, awaiting="confirm")
+                provided = set(pending.get("provided") or []) | provided_fields_from_item(
+                    updated
+                )
+                self._set_pending(
+                    context,
+                    item=updated,
+                    awaiting="confirm",
+                    provided=provided,
+                    return_to_recap=False,
+                )
                 try:
                     await status.delete()
                 except Exception:
                     logger.debug("Could not clear 'Updating…' status", exc_info=True)
                 await self._show_recap(update.message, context, edit=False)
+                return
+
+            if awaiting in CLARIFY_FIELDS:
+                error = await self._finish_field_answer(
+                    update.message, context, awaiting, text, edit=False
+                )
+                if error:
+                    await update.message.reply_text(error)
                 return
 
         if is_non_item_message(text):
@@ -1024,7 +1379,7 @@ class InventoryBotRuntime:
         # conversationally, without requiring the /add prefix.
         status = await update.message.reply_text("🔍 Preparing details…")
         try:
-            item, has_name = await self.resolve_item_from_text(text)
+            item, provided = await self.resolve_item_from_text(text)
         except Exception:
             logger.exception("Implicit add failed for text=%r", text)
             await status.edit_text(
@@ -1032,7 +1387,7 @@ class InventoryBotRuntime:
             )
             return
         await status.delete()
-        await self._begin_add_flow(update, context, item=item, has_name=has_name)
+        await self._begin_add_flow(update, context, item=item, provided=provided)
 
     async def _reply_search_results(
         self, update: Update, *, query: str, matches: list[dict[str, Any]], status_message
@@ -1155,6 +1510,60 @@ class InventoryBotRuntime:
             await query.edit_message_text(
                 "✅ *Saved*\n\n" + format_item_markdown(item), parse_mode=ParseMode.MARKDOWN
             )
+            return
+
+        if data.startswith("cf:"):
+            pending = self._get_pending(context)
+            if not pending:
+                await query.answer(
+                    "Add session expired — send a photo or /add again.",
+                    show_alert=True,
+                )
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                return
+            await query.answer()
+
+            if data == "cf:skip":
+                field = pending.get("awaiting")
+                if field not in {"units_per_package", "size_value", "notes", "brand"}:
+                    return
+                error = await self._finish_field_answer(
+                    query.message, context, field, "skip", edit=True
+                )
+                if error:
+                    await query.edit_message_text(f"❌ {error}")
+                return
+
+            if data.startswith("cf:exp:"):
+                action = data.split(":", 2)[-1]
+                value = "keep" if action == "keep" else "skip"
+                error = await self._finish_field_answer(
+                    query.message, context, "expiry_date", value, edit=True
+                )
+                if error:
+                    await query.edit_message_text(f"❌ {error}")
+                return
+
+            choice_match = re.fullmatch(r"cf:v:([a-z]+):(\d+)", data)
+            if choice_match:
+                field_key, idx_str = choice_match.groups()
+                field = CALLBACK_KEY_TO_FIELD.get(field_key)
+                choices = FIELD_CHOICES.get(field or "", [])
+                idx = int(idx_str)
+                if not field or idx < 0 or idx >= len(choices):
+                    await query.edit_message_text("❌ Invalid choice.")
+                    return
+                error = await self._finish_field_answer(
+                    query.message, context, field, choices[idx], edit=True
+                )
+                if error:
+                    await query.edit_message_text(f"❌ {error}")
+                return
+
+            await query.edit_message_text("❌ Unknown action.")
             return
 
         await query.answer()

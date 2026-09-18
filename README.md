@@ -8,7 +8,7 @@ Run a local web UI to start/stop automations. Each automation is its own Telegra
 
 | Automation | What it does |
 |------------|----------------|
-| **Household Inventory** | One bot for pantry groceries and medicine/supplements in a single Google Sheet. Add items from text or photos — Gemini figures out the category; `/search` matches by name, brand, category, or (for medicine) symptoms (e.g. `headache` → paracetamol). Adding is conversational: describe the item, confirm a one-message recap, correct anything by just typing — no step-by-step wizard. |
+| **Household Inventory** | One bot for pantry groceries and medicine/supplements in a single Google Sheet. Add items from text or photos — Gemini figures out the category; `/search` matches by name, brand, category, or (for medicine) symptoms (e.g. `headache` → paracetamol). Adding is conversational: Gemini fills what it can, the bot asks only for blank/important fields, then you confirm a recap (or type `change location` to reopen that picker). |
 
 ## Architecture
 
@@ -85,7 +85,7 @@ Never commit `.env` or `credentials.json` — they are gitignored.
 | `/list` | Recent items |
 | `/cancel` | Cancel an in-progress add |
 
-Adding is a short conversation, not a fixed wizard: describe the item (or send a photo), the bot fills in everything it can and asks only if the name itself is unclear, then shows a one-message recap. Reply with any correction in plain English (e.g. "actually 3 packs, put it in the basement") or tap **Save**/**Cancel**.
+Adding is a short conversation: describe the item (or send a photo), the bot fills what it can, then asks only for blank or important fields (buttons + Skip). After that it shows a one-message recap. Reply with a correction in plain English (e.g. `make it 2 bottles`), type `change location` to reopen that picker, or tap **Save**/**Cancel**.
 
 ## Google Sheet schema
 
